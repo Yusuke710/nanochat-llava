@@ -1,0 +1,32 @@
+benchmark,coverage,median_abs_error_when_held_out,median_abs_percentage_error_when_held_out,prediction_coverage,top_5_predictor_benchmarks,correlation_cluster,notes
+Video-MME,1,19.33807605635731,37.11722851508121,1.0,,video,video understanding
+MLVU,1,16.238076056357308,29.416804449922658,1.0,,video,multi-task long video understanding
+BetterChartQA,4,16.000000000000014,27.118644067796634,1.0,,chart_document,harder chart reasoning
+MathVision,2,8.769999999999996,34.98205025927402,1.0,,math_science,hard visual math reasoning
+EgoSchema,4,7.899999999999999,12.616435494860177,1.0,,video,long video understanding
+VizWiz,8,7.258487628587716,13.773647212220922,1.0,MMVet;VQAv2;TextVQA;GQA;SEED-Image,natural_image,assistive image QA
+DUDE,4,6.0,13.290513833992096,1.0,,ocr_document,multi-page document understanding
+VQAv2,18,5.768389374616106,7.543372344367349,1.0,LLaVA-Bench-Wild;SEED-Image;MME;GQA;ChartQA,natural_image,natural image VQA
+LLaVA-Bench-Wild,8,5.67225914906021,7.429878461348696,1.0,TextVQA;VQAv2;SEED-Image;MME;MMVet,instruction_judge,in-the-wild instruction following
+InfographicVQA,4,5.050328647527721,6.289325837518955,1.0,,ocr_document,infographic document QA
+OCRBench,31,4.968132060211289,6.107805468047988,1.0,TextVQA;DocVQA;MME;MMStar;MathVista,ocr_text,OCR aggregate benchmark
+InfoVQA,22,4.303481727659953,6.5145940989185736,1.0,RealWorldQA;DocVQA;MMStar;MMBench;VQAv2,ocr_document,infographic document QA
+SEED-Image,8,4.050577124772339,6.718862992286718,1.0,VQAv2;MME;TextVQA;LLaVA-Bench-Wild;MMVet,general_perception,general image understanding
+ScienceQA,12,4.016029365010326,5.322617360824079,1.0,MMBench;MMBench-CN;MathVista;GQA;MMVet,math_science,science and diagram-style QA
+MathVista,40,4.011642953058065,6.925681842207217,1.0,MMStar;ScienceQA;MME;HallusionBench;MMBench-CN,math_science,visual math reasoning
+MME,20,3.896263516642378,5.908823691717513,1.0,SEED-Image;LLaVA-Bench-Wild;VQAv2;MMStar;GQA,general_perception,general perception and cognition aggregate
+RealWorldQA,20,3.7180117259504506,5.621265917541237,1.0,InfoVQA;VQAv2;MME;TextVQA;DocVQA,real_world,real-world visual perception
+MMBench-CN,25,3.3202319493300934,4.754264140933456,1.0,MMBench;ScienceQA;HallusionBench;MMStar;MME,general_reasoning,Chinese MMBench variant
+MMMU,43,3.276841111026968,6.489512300867363,1.0,MMVet;MMStar;MMBench-CN;MMBench;MathVista,general_reasoning,multidiscipline multimodal reasoning
+TextVQA,40,3.077245822951866,4.102964341514237,1.0,LLaVA-Bench-Wild;SEED-Image;GQA;DocVQA;MME,ocr_text,scene text OCR QA
+AI2D,37,2.832307061912843,3.4073317454601586,1.0,MME;VQAv2;MMStar;InfoVQA;MMMU,math_science,science diagrams
+ChartQA,29,2.7365283294646616,3.538138198976737,1.0,VQAv2;DocVQA;MMStar;InfoVQA;MathVista,chart_document,chart and plot reasoning
+MMVet,35,2.424433281392062,3.809847036133696,1.0,SEED-Image;LLaVA-Bench-Wild;GQA;VizWiz;MMMU,general_reasoning_judge,LLM-judge multi-skill benchmark
+MMStar,31,1.9706796699468896,3.247159361880821,1.0,HallusionBench;MathVista;MMBench;MME;ChartQA,general_reasoning,vision-indispensable multimodal reasoning
+MMBench,35,1.5714897591244252,1.8889607042974565,1.0,ScienceQA;MMBench-CN;MMStar;HallusionBench;MME,general_reasoning,general multimodal reasoning
+DocVQA,32,1.5339223664779382,2.1068653697188937,1.0,ChartQA;VQAv2;InfoVQA;TextVQA;MMStar,ocr_document,document OCR and layout QA
+POPE,17,1.428139622073786,1.6207234985941275,1.0,MME;ScienceQA;GQA;TextVQA;MMBench-CN,hallucination_grounding,object hallucination probe
+HallusionBench,27,1.3915737794267997,2.8704880887179938,1.0,MMStar;MMBench;MMBench-CN;MathVista;MME,hallucination_grounding,hallucination and visual grounding
+GQA,8,0.4569654576716573,0.721904356511307,1.0,VQAv2;MMVet;LLaVA-Bench-Wild;TextVQA;SEED-Image,natural_image,compositional image QA
+MMMU-Pro,3,,,,,general_reasoning,harder multimodal reasoning
+MVBench,1,,,,,video,video understanding

@@ -1,0 +1,10 @@
+model_id,provider,weight_class,modalities,include_in_vlm_matrix,status,source_url,note
+GPT-5.5,OpenAI,closed,"text,image,tools",yes,scored,https://openai.com/index/introducing-gpt-5-5/,"Current OpenAI frontier release with official OSWorld and MMMU-Pro rows."
+Claude-Opus-4.7,Anthropic,closed,"text,image,tools",yes,scored,https://www.anthropic.com/news/claude-opus-4-7,"Anthropic release confirms substantially better vision; compatible benchmark rows were taken from Google DeepMind's public comparison table."
+Gemini-3.5-Flash,Google DeepMind,closed,"text,image,tools",yes,scored,https://deepmind.google/models/gemini/,"Latest Gemini page lists Gemini 3.5 Flash, Gemini 3 Flash, and Gemini 3.1 Pro benchmark rows."
+Gemini-3.1-Pro,Google DeepMind,closed,"text,image,tools",yes,scored,https://deepmind.google/models/gemini/,"Included because it is the stronger Pro-family Gemini row in the public table."
+Grok-4.3,xAI,closed,"text,image",no,no compatible official VLM scores,https://docs.x.ai/developers/models,"Current xAI docs list Grok 4.3 as the recommended flagship and note older Grok 4 variants retired, but do not publish comparable vision benchmark scores."
+Kimi-K2.6,Moonshot AI,open-weight,"text,image,video,tools",yes,scored,https://huggingface.co/moonshotai/Kimi-K2.6,"Official Moonshot AI model card publishes MMMU-Pro, CharXiv, MathVision, OSWorld, and modality details."
+Qwen3.6-35B-A3B,Qwen,open-weight,"text,image,video",yes,scored,https://huggingface.co/Qwen/Qwen3.6-35B-A3B,"Official Qwen model card publishes MMMU, MMMU-Pro, MathVista, RealWorldQA, MMBench, and HallusionBench rows."
+DeepSeek-V4-Pro,DeepSeek,open-weight,text,no,not a VLM row,https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro,"Official Hugging Face listing is Text Generation; no compatible image-text benchmark rows found for the vision report."
+GLM-5.1,Z.ai,open-weight,text,no,not a VLM row,https://huggingface.co/zai-org/GLM-5.1,"Official Hugging Face listing is Text Generation and the published focus is agentic engineering/coding, not VLM scoring."

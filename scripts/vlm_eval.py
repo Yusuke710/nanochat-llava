@@ -4,7 +4,7 @@ Small verifier eval for nanochat-llava v0.
 This is intentionally a subset runner, not a full leaderboard harness. It loads
 MMStar, ScienceQA, ChartQA, MMMU, and TextVQA through Hugging Face datasets,
 runs naive image-conditioned generation, and writes JSON scores so stage-to-stage
-progress or failed visual controls are visible in logs.
+progress is visible in logs.
 """
 
 import argparse
@@ -125,14 +125,6 @@ def exact_or_choice_match(pred, answers):
     return False
 
 
-def visual_control_passes(score, zero_image_score, margin=0.0):
-    return score > zero_image_score + margin
-
-
-def predictions_differ(left, right):
-    return normalize_answer(left) != normalize_answer(right)
-
-
 def as_list(value):
     if isinstance(value, list):
         return value
@@ -249,21 +241,14 @@ def make_result_sample(
     pred,
     answers,
     is_correct,
-    control_pred=None,
-    control_is_correct=None,
 ):
-    sample = {
+    return {
         "index": index,
         "prompt": preview_text(make_prompt(record)),
         "prediction": preview_text(pred),
         "prediction_correct": bool(is_correct),
         "answers": [preview_text(a, 80) for a in as_list(answers)],
     }
-    if control_pred is not None:
-        sample["zero_image_prediction"] = preview_text(control_pred)
-        sample["zero_image_correct"] = bool(control_is_correct)
-        sample["prediction_changed"] = predictions_differ(pred, control_pred)
-    return sample
 
 
 def load_benchmark(name, config=None):
@@ -274,6 +259,88 @@ def load_benchmark(name, config=None):
     if config is not None:
         return load_dataset(cfg["dataset"], config, split=cfg["split"])
     return load_dataset(cfg["dataset"], split=cfg["split"])
+
+
+def evaluate_vlm(
+    model,
+    projector,
+    tokenizer,
+    extractor,
+    benchmarks="mmstar,scienceqa,chartqa,mmmu,textvqa",
+    mmmu_configs="Accounting",
+    limit=32,
+    max_scan=0,
+    max_new_tokens=16,
+    print_samples=0,
+):
+    benchmark_names = [b.strip() for b in str(benchmarks).split(",") if b.strip()]
+    specs = benchmark_specs(benchmark_names, mmmu_configs)
+    results = {
+        "requested_benchmarks": benchmark_names,
+        "resolved_benchmarks": specs,
+        "mmmu_configs": mmmu_configs,
+        "limit": limit,
+        "max_scan": max_scan,
+        "max_new_tokens": max_new_tokens,
+        "print_samples": print_samples,
+        "benchmarks": {},
+    }
+    model_was_training = model.training
+    projector_was_training = projector.training
+    model.eval()
+    projector.eval()
+    try:
+        for spec in specs:
+            name = spec["name"]
+            row_key = spec["key"]
+            ds = load_benchmark(name, spec.get("config"))
+            correct = 0
+            total = 0
+            skipped = 0
+            scanned = 0
+            samples = []
+            scan_limit = max_scan if max_scan > 0 else (limit * 20 if limit > 0 else 0)
+            for rec in ds:
+                if limit > 0 and total >= limit:
+                    break
+                if scan_limit > 0 and scanned >= scan_limit:
+                    break
+                scanned += 1
+                try:
+                    image = get_image(rec)
+                    prompt_tokens = render_prompt_tokens(tokenizer, make_prompt(rec))
+                    feats = extractor([image])
+                    pred_tokens = generate_vision(
+                        model,
+                        projector,
+                        tokenizer,
+                        prompt_tokens,
+                        feats,
+                        max_tokens=max_new_tokens,
+                        temperature=0.0,
+                    )
+                    pred = tokenizer.decode(pred_tokens)
+                    answers = get_answers(rec)
+                    is_correct = exact_or_choice_match(pred, answers)
+                    correct += int(is_correct)
+                    if len(samples) < print_samples:
+                        sample = make_result_sample(rec, scanned - 1, pred, answers, is_correct)
+                        samples.append(sample)
+                        print0(f"{row_key} sample {len(samples)} | pred={sample['prediction']!r} | answers={sample['answers']}")
+                    total += 1
+                except Exception as e:
+                    skipped += 1
+                    print0(f"{row_key}: skipped one record: {type(e).__name__}: {e}")
+            score = correct / max(total, 1)
+            row = {"benchmark": name, "config": spec.get("config"), "n": total, "skipped": skipped, "scanned": scanned, "score": score}
+            if samples:
+                row["samples"] = samples
+            results["benchmarks"][row_key] = row
+            print0(f"{row_key}: score={score:.4f} n={total} skipped={skipped} scanned={scanned}")
+    finally:
+        model.train(model_was_training)
+        projector.train(projector_was_training)
+    return results
 
 
 def load_vlm(args, device):
@@ -304,8 +371,6 @@ def main():
     parser.add_argument("--siglip-cache-dir", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--print-samples", type=int, default=0, help="print and store up to N generations per benchmark")
-    parser.add_argument("--control", action="store_true", help="also score zero-image control")
-    parser.add_argument("--control-margin", type=float, default=0.0, help="minimum score margin for image-conditioned run to pass zero-image control")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -315,118 +380,29 @@ def main():
     siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
     extractor = SigLIPPooledFeatureExtractor(args.siglip_model_id, device=device, cache_dir=siglip_cache_dir, verbose=True)
     gpu_name = torch.cuda.get_device_name(0) if device_type == "cuda" else device_type
-    benchmark_names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
-    specs = benchmark_specs(benchmark_names, args.mmmu_configs)
     print0(
         f"VLM eval | GPU: {gpu_name} | checkpoint: {args.checkpoint_dir}@{args.checkpoint_step} | "
-        f"benchmarks: {','.join(s['key'] for s in specs)} | limit: {args.limit} | max_scan: {args.max_scan} | "
-        f"control: {args.control} margin: {args.control_margin}"
+        f"benchmarks: {args.benchmarks} | limit: {args.limit} | max_scan: {args.max_scan}"
     )
-
-    results = {
+    results = evaluate_vlm(
+        model,
+        projector,
+        tokenizer,
+        extractor,
+        benchmarks=args.benchmarks,
+        mmmu_configs=args.mmmu_configs,
+        limit=args.limit,
+        max_scan=args.max_scan,
+        max_new_tokens=args.max_new_tokens,
+        print_samples=args.print_samples,
+    )
+    results.update({
         "checkpoint_dir": args.checkpoint_dir,
         "checkpoint_step": args.checkpoint_step,
         "gpu": gpu_name,
-        "requested_benchmarks": benchmark_names,
-        "resolved_benchmarks": specs,
-        "mmmu_configs": args.mmmu_configs,
-        "limit": args.limit,
-        "max_scan": args.max_scan,
-        "control": args.control,
-        "control_margin": args.control_margin,
-        "max_new_tokens": args.max_new_tokens,
-        "print_samples": args.print_samples,
         "siglip_model_id": args.siglip_model_id,
         "checkpoint_meta": vlm_meta,
-        "benchmarks": {},
-    }
-    for spec in specs:
-        name = spec["name"]
-        row_key = spec["key"]
-        ds = load_benchmark(name, spec.get("config"))
-        correct = 0
-        control_correct = 0
-        image_only_correct = 0
-        zero_only_correct = 0
-        both_correct = 0
-        both_wrong = 0
-        prediction_changed = 0
-        total = 0
-        skipped = 0
-        scanned = 0
-        samples = []
-        max_scan = args.max_scan if args.max_scan > 0 else (args.limit * 20 if args.limit > 0 else 0)
-        for rec in ds:
-            if args.limit > 0 and total >= args.limit:
-                break
-            if max_scan > 0 and scanned >= max_scan:
-                break
-            scanned += 1
-            try:
-                image = get_image(rec)
-                prompt_tokens = render_prompt_tokens(tokenizer, make_prompt(rec))
-                feats = extractor([image])
-                pred_tokens = generate_vision(model, projector, tokenizer, prompt_tokens, feats, max_tokens=args.max_new_tokens, temperature=0.0)
-                pred = tokenizer.decode(pred_tokens)
-                answers = get_answers(rec)
-                is_correct = exact_or_choice_match(pred, answers)
-                correct += int(is_correct)
-                control_pred = None
-                control_is_correct = None
-                if args.control:
-                    control_tokens = generate_vision(model, projector, tokenizer, prompt_tokens, torch.zeros_like(feats), max_tokens=args.max_new_tokens, temperature=0.0)
-                    control_pred = tokenizer.decode(control_tokens)
-                    control_is_correct = exact_or_choice_match(control_pred, answers)
-                    control_correct += int(control_is_correct)
-                    image_only_correct += int(is_correct and not control_is_correct)
-                    zero_only_correct += int(control_is_correct and not is_correct)
-                    both_correct += int(is_correct and control_is_correct)
-                    both_wrong += int(not is_correct and not control_is_correct)
-                    prediction_changed += int(predictions_differ(pred, control_pred))
-                if len(samples) < args.print_samples:
-                    sample = make_result_sample(
-                        rec,
-                        scanned - 1,
-                        pred,
-                        answers,
-                        is_correct,
-                        control_pred=control_pred,
-                        control_is_correct=control_is_correct,
-                    )
-                    samples.append(sample)
-                    print0(
-                        f"{row_key} sample {len(samples)} | pred={sample['prediction']!r}"
-                        + (f" | zero={sample['zero_image_prediction']!r}" if control_pred is not None else "")
-                        + f" | answers={sample['answers']}"
-                    )
-                total += 1
-            except Exception as e:
-                skipped += 1
-                print0(f"{row_key}: skipped one record: {type(e).__name__}: {e}")
-        score = correct / max(total, 1)
-        row = {"benchmark": name, "config": spec.get("config"), "n": total, "skipped": skipped, "scanned": scanned, "score": score}
-        if args.control:
-            row["zero_image_score"] = control_correct / max(total, 1)
-            row["visual_control_pass"] = visual_control_passes(row["score"], row["zero_image_score"], args.control_margin)
-            row["image_only_correct"] = image_only_correct
-            row["zero_only_correct"] = zero_only_correct
-            row["both_correct"] = both_correct
-            row["both_wrong"] = both_wrong
-            row["prediction_changed"] = prediction_changed
-            row["prediction_changed_rate"] = prediction_changed / max(total, 1)
-        if samples:
-            row["samples"] = samples
-        results["benchmarks"][row_key] = row
-        print0(
-            f"{row_key}: score={score:.4f} n={total} skipped={skipped} scanned={scanned}"
-            + (
-                f" zero_image={row['zero_image_score']:.4f} control_pass={row['visual_control_pass']}"
-                f" image_only={row['image_only_correct']} zero_only={row['zero_only_correct']}"
-                f" changed={row['prediction_changed']}/{total}"
-                if args.control
-                else ""
-            )
-        )
+    })
 
     if args.out:
         out_dir = os.path.dirname(args.out)

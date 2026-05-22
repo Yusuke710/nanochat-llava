@@ -161,7 +161,6 @@ def build_eval_cmd(
     max_scan: int = 0,
     print_samples: int = 0,
     model_step: int = 650,
-    control: bool = True,
 ):
     cmd = [
         "python",
@@ -186,8 +185,6 @@ def build_eval_cmd(
         cmd += ["--max-scan", str(max_scan)]
     if print_samples > 0:
         cmd += ["--print-samples", str(print_samples)]
-    if control:
-        cmd += ["--control", "--control-margin", "0.0"]
     return cmd
 
 
@@ -295,6 +292,5 @@ def eval(
     max_scan: int = 0,
     print_samples: int = 0,
     model_step: int = 650,
-    control: bool = True,
 ):
-    _run(build_eval_cmd(checkpoint_dir, checkpoint_step, out, benchmarks, mmmu_configs, limit, max_scan, print_samples, model_step, control))
+    _run(build_eval_cmd(checkpoint_dir, checkpoint_step, out, benchmarks, mmmu_configs, limit, max_scan, print_samples, model_step))

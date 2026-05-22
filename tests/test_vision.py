@@ -29,12 +29,12 @@ from scripts import vlm_train
 from scripts.vlm_eval import (
     benchmark_specs,
     coerce_options,
+    evaluate_vlm,
     exact_or_choice_match,
     get_answers,
     make_prompt,
     make_result_sample,
     parse_inline_options,
-    visual_control_passes,
 )
 from scripts.vlm_train import (
     batch_features_and_examples,
@@ -338,13 +338,39 @@ def test_eval_prompt_matching_and_samples():
     assert not exact_or_choice_match("a chart", ["A"])
     assert coerce_options("['cat', 'dog']") == ["cat", "dog"]
     assert parse_inline_options("Options: A: cat, B: dog") == ["cat", "dog"]
-    assert visual_control_passes(0.4, 0.3, margin=0.05)
     assert benchmark_specs(["mmmu"], mmmu_configs="Accounting,Basic_Medical_Science")[1]["key"] == "mmmu_Basic_Medical_Science"
 
-    sample = make_result_sample(record, 3, "A", ["A"], True, control_pred="B", control_is_correct=False)
+    sample = make_result_sample(record, 3, "A", ["A"], True)
     assert sample["prediction_correct"] is True
-    assert sample["zero_image_correct"] is False
-    assert sample["prediction_changed"] is True
+
+
+def test_evaluate_vlm_small_loop_restores_train_mode(monkeypatch):
+    image = Image.new("RGB", (4, 4), color=(255, 0, 0))
+
+    def fake_load_benchmark(name, config=None):
+        return [{"question": "What color?", "options": ["red", "blue"], "answer": "A", "image": image}]
+
+    class Extractor:
+        def __call__(self, images):
+            return torch.randn(len(images), VISION_TOKENS, 8)
+
+    monkeypatch.setattr("scripts.vlm_eval.load_benchmark", fake_load_benchmark)
+    model, projector = tiny_model()
+    model.train()
+    projector.train()
+    results = evaluate_vlm(
+        model,
+        projector,
+        TinyTokenizer(),
+        Extractor(),
+        benchmarks="mmstar",
+        limit=1,
+        max_scan=1,
+        max_new_tokens=1,
+    )
+    assert results["benchmarks"]["mmstar"]["n"] == 1
+    assert model.training
+    assert projector.training
 
 
 def test_lr_schedule_and_modal_command_builders():
@@ -377,4 +403,3 @@ def test_lr_schedule_and_modal_command_builders():
     eval_cmd = modal_vlm.build_eval_cmd(limit=3, max_scan=9, benchmarks="mmstar,chartqa", print_samples=2)
     assert eval_cmd[:3] == ["python", "-m", "scripts.vlm_eval"]
     assert eval_cmd[eval_cmd.index("--benchmarks") + 1] == "mmstar,chartqa"
-    assert "--control" in eval_cmd

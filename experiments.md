@@ -9,8 +9,8 @@ were intentionally removed to keep the implementation minimal.
 - `nanochat/vision.py`: `<image>` marker handling, frozen SigLIP base patch-16/512, nanoVLM-style 8x8 pixel-shuffle pooling to 64 visual tokens, linear projector, single-image visual-token insertion, target masking, generation helper, VLM checkpoint helpers, and HF nanochat-d32 linking.
 - `nanochat/gpt.py`: thin optional `input_embeds` / `value_token_ids` hook in `GPT.forward`; ordinary text-only `model(idx, targets)` behavior is preserved.
 - `nanochat/checkpoint_manager.py`: compatibility patching for old `karpathy/nanochat-d32` checkpoint keys missing from the current GPT module.
-- `scripts/vlm_train.py`: two-stage VLM trainer. Stage 1 freezes nanochat and SigLIP, trains only the projector. Stage 2 freezes SigLIP, trains projector plus nanochat. Stage 2 defaults to FineVision `LLaVA_Instruct_150K`, using the nanoVLM-style `images` + `texts` schema with embedded image bytes. Legacy HF JSON rows still stream when `--hf-file` is passed.
-- `scripts/vlm_eval.py`: verifier subset runner for MMStar, ScienceQA, ChartQA, MMMU, and TextVQA with optional zero-image controls and stored sample generations.
+- `scripts/vlm_train.py`: two-stage VLM trainer. Stage 1 freezes nanochat and SigLIP, trains only the projector. Stage 2 freezes SigLIP, trains projector plus nanochat. Stage 2 defaults to FineVision `LLaVA_Instruct_150K`, using the nanoVLM-style `images` + `texts` schema with embedded image bytes. Legacy HF JSON rows still stream when `--hf-file` is passed. Optional `--eval-every` runs a small VLM benchmark loop during training.
+- `scripts/vlm_eval.py`: verifier subset runner for MMStar, ScienceQA, ChartQA, MMMU, and TextVQA. It exposes `evaluate_vlm(...)` for training-time checks, and the CLI evaluates one checkpoint, stores scores and sample generations, and leaves checkpoint-to-checkpoint comparisons outside the script.
 - `tests/test_vision.py` and `tests/test_vlm_smoke.py`: focused unit tests plus synthetic image-conditioned overfit/control smoke. The smoke now lives in tests, not scripts.
 - `modal_vlm.py`: minimal Modal wrapper with `doctor`, `smoke`, `stage1`, `stage2`, and `eval` only. Default GPU is `A100-80GB`; set `NANOCHAT_MODAL_GPU=H100` to switch.
 - `RUNBOOK_GPU.md`: external-GPU runbook, streamed-data behavior, Stage 1/Stage 2/eval commands, and go/no-go criteria.
@@ -19,8 +19,8 @@ were intentionally removed to keep the implementation minimal.
 
 - Do not re-add `vlm_precompute_siglip.py`, online feature caches, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, or benchmark report generators unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.
 - Keep inline SigLIP for v0. For streamed LLaVA, images are mostly unique, so a repeated-image cache is not aligned with the data path.
-- Do not judge success from aggregate benchmark numbers alone. Inspect stored sample generations and zero-image controls.
-- Keep Stage 2 starting from the SFT d32 checkpoint and the Stage 1 projector checkpoint. Old non-pixel-shuffle checkpoints are incompatible with the current `12288` projector input dimension.
+- Do not judge success from aggregate benchmark numbers alone. Compare separate checkpoint eval JSONs and inspect stored sample generations.
+- Stage 2 can start directly from the SFT d32 checkpoint or from a Stage 1 projector checkpoint when explicitly testing that path. Old non-pixel-shuffle checkpoints are incompatible with the current `12288` projector input dimension.
 
 ## Current commands
 
@@ -51,13 +51,10 @@ uv run --extra vision modal run modal_vlm.py::eval \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
   --limit 16 \
   --max-scan 240 \
-  --print-samples 3 \
-  --control
+  --print-samples 3
 
 uv run --extra vision modal run modal_vlm.py::stage2 \
-  --init-checkpoint-dir /vol/checkpoints/stage1_pixshuffle_250 \
-  --init-checkpoint-step 250 \
-  --out-dir /vol/checkpoints/stage2_llava_probe \
+  --out-dir /vol/checkpoints/stage2_direct_finevision_probe \
   --num-iterations 100 \
   --batch-size 24 \
   --max-batch-tokens 12000 \
@@ -65,22 +62,21 @@ uv run --extra vision modal run modal_vlm.py::stage2 \
   --profile-timing
 
 uv run --extra vision modal run modal_vlm.py::eval \
-  --checkpoint-dir /vol/checkpoints/stage2_llava_probe \
+  --checkpoint-dir /vol/checkpoints/stage2_direct_finevision_probe \
   --checkpoint-step 100 \
-  --out /vol/bench/stage2_llava_probe.json \
+  --out /vol/bench/stage2_direct_finevision_probe.json \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
   --limit 16 \
   --max-scan 240 \
-  --print-samples 3 \
-  --control
+  --print-samples 3
 ```
 
 ## Remaining proof
 
 The local code path is ready for a scaled probe, but model-quality success is
-not proven until a real GPU run produces Stage 1 and Stage 2 eval JSONs. Compare
-scores, zero-image controls, prediction-change rates, and sample generations
-before launching longer training.
+not proven until a real GPU run produces a training-time eval trail or standalone
+Stage 1/Stage 2 eval JSONs. Compare scores and sample generations across
+checkpoints before launching longer training.
 
 
 # nanochat-llava GPU Probe Notes

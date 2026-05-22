@@ -39,6 +39,7 @@ from nanochat.vision import (
     render_vision_conversation,
     save_vlm_checkpoint,
 )
+from scripts.vlm_eval import evaluate_vlm
 
 
 IMAGE_KEYS = ("image", "image_path", "filename", "path")
@@ -540,6 +541,13 @@ def main():
     parser.add_argument("--num-iterations", type=int, default=1000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--projector-lr", type=float, default=2e-3)
+    parser.add_argument("--eval-every", type=int, default=-1, help="run small VLM benchmark eval every N steps (-1 = disable)")
+    parser.add_argument("--eval-benchmarks", default="mmstar,scienceqa,chartqa,mmmu,textvqa")
+    parser.add_argument("--eval-mmmu-configs", default="Accounting")
+    parser.add_argument("--eval-limit", type=int, default=16)
+    parser.add_argument("--eval-max-scan", type=int, default=240)
+    parser.add_argument("--eval-max-new-tokens", type=int, default=16)
+    parser.add_argument("--eval-print-samples", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--profile-timing", action="store_true", help="log per-step image decode/processor/SigLIP and LLM timing")
@@ -759,6 +767,28 @@ def main():
                 flush=True,
             )
             wandb_run.log(log_data)
+        if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.num_iterations):
+            eval_results = evaluate_vlm(
+                model,
+                projector,
+                tokenizer,
+                extractor,
+                benchmarks=args.eval_benchmarks,
+                mmmu_configs=args.eval_mmmu_configs,
+                limit=args.eval_limit,
+                max_scan=args.eval_max_scan,
+                max_new_tokens=args.eval_max_new_tokens,
+                print_samples=args.eval_print_samples,
+            )
+            eval_scores = {key: row["score"] for key, row in eval_results["benchmarks"].items()}
+            eval_mean = sum(eval_scores.values()) / max(len(eval_scores), 1)
+            score_str = " ".join(f"{key}={score:.3f}" for key, score in eval_scores.items())
+            print0(f"step {step:05d}/{args.num_iterations:05d} | vlm_eval_mean {eval_mean:.4f} | {score_str}", flush=True)
+            wandb_run.log({
+                "step": step,
+                "eval/mean_score": eval_mean,
+                **{f"eval/{key}_score": score for key, score in eval_scores.items()},
+            })
         if args.save_every > 0 and step % args.save_every == 0:
             save_training_checkpoint(out_dir, step, model, projector, args, meta, data_path, rank=ddp_rank)
 

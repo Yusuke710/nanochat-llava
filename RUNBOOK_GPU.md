@@ -77,7 +77,6 @@ uv run --extra vision --extra gpu python -m scripts.vlm_eval \
   --limit 16 \
   --max-scan 240 \
   --print-samples 3 \
-  --control \
   --out $DATA_ROOT/bench/stage1_pixshuffle_250.json \
   --device-type cuda \
   --model-step 650
@@ -105,7 +104,11 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --max-seq-len 2048 \
   --save-every 100 \
   --model-step 650 \
-  --profile-timing
+  --profile-timing \
+  --eval-every 100 \
+  --eval-limit 16 \
+  --eval-max-scan 240 \
+  --eval-print-samples 3
 ```
 
 ## Benchmark Stage 2
@@ -118,7 +121,6 @@ uv run --extra vision --extra gpu python -m scripts.vlm_eval \
   --limit 16 \
   --max-scan 240 \
   --print-samples 3 \
-  --control \
   --out $DATA_ROOT/bench/stage2_direct_finevision_probe.json \
   --device-type cuda \
   --model-step 650
@@ -133,14 +135,14 @@ and whether sample generations are image-relevant.
 Use this cheap probe as a gate before spending on longer LLaVA training:
 
 - Continue if Stage 2 logs show stable loss, nonzero `samples/sec`/`tokens/sec`,
-  reasonable peak memory headroom, and at least some benchmark/sample evidence
-  that image-conditioned answers differ from zero-image answers in a useful way.
-- Stop and inspect before scaling if loss is flat or exploding, controls usually
-  fail, Stage 2 score is not better than Stage 1 on any verifier subset, or
-  sample generations look like text-only priors/gibberish rather than image
+  reasonable peak memory headroom, improved scores versus an earlier checkpoint,
+  and sample generations that are image-relevant.
+- Stop and inspect before scaling if loss is flat or exploding, the later
+  checkpoint is not better than the earlier checkpoint on any verifier subset,
+  or sample generations look like text-only priors/gibberish rather than image
   answers.
-- Do not treat one noisy benchmark number as proof. Check the printed samples
-  and the `stage2_zero` / `changed` columns from the inspection command.
+- Do not treat one noisy benchmark number as proof. Run eval on two checkpoints
+  such as step 100 and step 500, then compare scores and printed samples.
 
 ## Inspect results
 
@@ -153,27 +155,23 @@ import os
 from pathlib import Path
 
 bench = Path(os.environ["DATA_ROOT"]) / "bench"
-before = json.loads((bench / "stage1_pixshuffle_250.json").read_text())
-after = json.loads((bench / "stage2_llava_probe.json").read_text())
+before = json.loads((bench / "stage2_direct_finevision_step100.json").read_text())
+after = json.loads((bench / "stage2_direct_finevision_step500.json").read_text())
 
-print("benchmark,stage1,stage2,delta,stage2_zero,changed")
+print("benchmark,before,after,delta")
 for key in sorted(after["benchmarks"]):
     b = before["benchmarks"].get(key, {})
     a = after["benchmarks"][key]
     before_score = float(b.get("score", 0.0))
     after_score = float(a.get("score", 0.0))
-    zero = a.get("zero_image_score", "")
-    changed = a.get("prediction_changed_rate", "")
-    print(f"{key},{before_score:.4f},{after_score:.4f},{after_score-before_score:+.4f},{zero},{changed}")
+    print(f"{key},{before_score:.4f},{after_score:.4f},{after_score-before_score:+.4f}")
 
-print("\nStage 2 sample generations:")
+print("\nLatest sample generations:")
 for key, row in after["benchmarks"].items():
     for sample in row.get("samples", [])[:3]:
         print(f"\n[{key} #{sample['index']}]")
         print("prompt:", sample.get("prompt", ""))
         print("pred:", sample.get("prediction", ""))
-        if "zero_image_prediction" in sample:
-            print("zero:", sample.get("zero_image_prediction", ""))
         print("answers:", sample.get("answers", []))
 PY
 ```

@@ -221,7 +221,6 @@ def test_training_checkpoint_metadata_records_vision_config(tmp_path):
         image_root="/images",
         image_zip=None,
         hf_image_zip=None,
-        image_url_template="http://x/{basename}",
         skip_bad_images=True,
         siglip_model_id="google/siglip-base-patch16-512",
         init_vlm_checkpoint_dir="/tmp/stage1",
@@ -232,7 +231,6 @@ def test_training_checkpoint_metadata_records_vision_config(tmp_path):
     _, _, _, meta = load_vlm_checkpoint(tmp_path, 3, torch.device("cpu"))
     assert meta["vision_config"]["vision_tokens"] == VISION_TOKENS
     assert meta["vision_config"]["projector_vision_dim"] == projector.vision_dim
-    assert meta["data_config"]["image_download_timeout"] == vlm_train.IMAGE_DOWNLOAD_TIMEOUT
 
 
 def test_training_rendering_filters_bad_rows_and_counts_targets():
@@ -273,7 +271,31 @@ def test_load_records_streams_hf_json(monkeypatch):
     assert source == "stream:repo/file.json first 3 rows"
 
 
-def test_image_zip_and_on_demand_loading(tmp_path, monkeypatch):
+def test_load_records_and_render_finevision_schema(monkeypatch):
+    streamed = [
+        {
+            "images": [Image.new("RGB", (4, 4), color=(1, 2, 3))],
+            "texts": [{"user": "What color?", "assistant": "Red."}],
+        }
+        for _ in range(2)
+    ]
+
+    def fake_load_dataset(repo, config, **kwargs):
+        assert repo == "repo"
+        assert config == "cfg"
+        assert kwargs["streaming"] is True
+        return iter(streamed)
+
+    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
+    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file=None, hf_config="cfg", stage=2, max_examples=1, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
+    records, source = load_records(args)
+    rendered = render_records(records, TinyTokenizer(), stage=2, max_seq_len=256)
+    assert source == "stream:repo/cfg first 1 rows"
+    assert len(rendered) == 1
+    assert count_image_tokens(rendered[0]["tokens"]) == 1
+
+
+def test_image_zip_and_finevision_loading(tmp_path):
     img = Image.new("RGB", (4, 4), color=(1, 2, 3))
     img_path = tmp_path / "tiny.jpg"
     img.save(img_path)
@@ -283,17 +305,15 @@ def test_image_zip_and_on_demand_loading(tmp_path, monkeypatch):
     loaded = open_image({"image": "tiny.jpg"}, tmp_path / "missing", image_zip=zip_path)
     assert loaded.size == (4, 4)
 
-    source = tmp_path / "source.jpg"
-    Image.new("RGB", (2, 2), color=(9, 8, 7)).save(source)
+    direct = open_image({"images": [Image.new("RGB", (3, 2), color=(1, 1, 1))]}, tmp_path)
+    assert direct.size == (3, 2)
 
-    def fake_urlretrieve(url, filename):
-        Path = __import__("pathlib").Path
-        Path(filename).write_bytes(source.read_bytes())
+    import io
 
-    monkeypatch.setattr(vlm_train.urllib.request, "urlretrieve", fake_urlretrieve)
-    fetched = open_image({"image": "remote/a.jpg", "url": "http://example/a.jpg"}, tmp_path / "cache")
-    assert fetched.size == (2, 2)
-    assert (tmp_path / "cache" / "remote" / "a.jpg").exists()
+    encoded = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(9, 8, 7)).save(encoded, format="PNG")
+    from_bytes = open_image({"images": [{"bytes": encoded.getvalue(), "path": None}]}, tmp_path)
+    assert from_bytes.size == (2, 2)
 
 
 def test_batch_features_can_skip_dead_images(tmp_path):
@@ -335,17 +355,24 @@ def test_lr_schedule_and_modal_command_builders():
     stage1 = modal_vlm.build_stage1_cmd(max_examples=8)
     assert stage1[:3] == ["python", "-m", "scripts.vlm_train"]
     assert stage1[stage1.index("--stage") + 1] == "1"
-    assert stage1[stage1.index("--hf-file") + 1] == "blip_laion_cc_sbu_558k_meta.json"
-    assert "--hf-image-zip" not in stage1
+    assert stage1[stage1.index("--hf-file") + 1] == "blip_laion_cc_sbu_558k.json"
+    assert stage1[stage1.index("--hf-image-zip") + 1] == "images.zip"
     assert "--skip-bad-images" in stage1
     assert "--feature-cache-dir" not in stage1
 
     stage2 = modal_vlm.build_stage2_cmd(init_checkpoint_step=250, max_examples=4, profile_timing=True)
     assert stage2[stage2.index("--stage") + 1] == "2"
-    assert stage2[stage2.index("--hf-file") + 1] == "llava_instruct_150k.json"
-    assert stage2[stage2.index("--image-url-template") + 1] == modal_vlm.COCO_TRAIN2017_IMAGE_URL
+    assert stage2[stage2.index("--hf-repo") + 1] == "HuggingFaceM4/FineVision"
+    assert stage2[stage2.index("--hf-config") + 1] == "LLaVA_Instruct_150K"
+    assert "--hf-file" not in stage2
+    assert "--image-url-template" not in stage2
+    assert "--init-vlm-checkpoint-dir" not in stage2
     assert "--profile-timing" in stage2
     assert "--pack-examples" not in stage2
+
+    stage2_from_stage1 = modal_vlm.build_stage2_cmd(init_checkpoint_dir="/stage1", init_checkpoint_step=250)
+    assert stage2_from_stage1[stage2_from_stage1.index("--init-vlm-checkpoint-dir") + 1] == "/stage1"
+    assert stage2_from_stage1[stage2_from_stage1.index("--init-vlm-checkpoint-step") + 1] == "250"
 
     eval_cmd = modal_vlm.build_eval_cmd(limit=3, max_scan=9, benchmarks="mmstar,chartqa", print_samples=2)
     assert eval_cmd[:3] == ["python", "-m", "scripts.vlm_eval"]

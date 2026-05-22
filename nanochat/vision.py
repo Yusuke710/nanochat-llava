@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -135,11 +136,32 @@ class SigLIPPooledFeatureExtractor:
             print(f"Loaded SigLIP vision model patch_dim={self.patch_dim} projected_feature_dim={self.vision_dim}", flush=True)
 
     @torch.no_grad()
-    def __call__(self, images) -> torch.Tensor:
+    def __call__(self, images, profile=None, synchronize=None) -> torch.Tensor:
+        sync = synchronize or (lambda: None)
+        t = time.perf_counter()
         inputs = self.processor(images=images, return_tensors="pt")
+        if profile is not None:
+            profile["image_processor"] += time.perf_counter() - t
+            sync()
+
+        t = time.perf_counter()
         pixel_values = inputs["pixel_values"].to(device=self.device, dtype=self.dtype)
+        if profile is not None:
+            sync()
+            profile["image_transfer"] += time.perf_counter() - t
+
+        t = time.perf_counter()
         out = self.model(pixel_values=pixel_values)
-        return pool_siglip_features(out.last_hidden_state, output_grid=self.output_grid)
+        if profile is not None:
+            sync()
+            profile["siglip_forward"] += time.perf_counter() - t
+
+        t = time.perf_counter()
+        pooled = pool_siglip_features(out.last_hidden_state, output_grid=self.output_grid)
+        if profile is not None:
+            sync()
+            profile["siglip_pool"] += time.perf_counter() - t
+        return pooled
 
 
 def encode_with_image_markers(tokenizer, text: str, image_token_id: int = IMAGE_TOKEN_ID) -> list[int]:

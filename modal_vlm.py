@@ -16,7 +16,6 @@ import modal
 
 APP_NAME = "nanochat-llava-v0"
 GPU_TYPE = os.environ.get("NANOCHAT_MODAL_GPU", "A100-80GB")
-COCO_TRAIN2017_IMAGE_URL = "http://images.cocodataset.org/train2017/{basename}"
 VOLUME_DIRS = ["/vol/datasets", "/vol/checkpoints", "/vol/logs", "/vol/bench", "/vol/nanochat", "/vol/hf"]
 VOL = modal.Volume.from_name("nanochat-llava-v0", create_if_missing=True)
 
@@ -72,7 +71,9 @@ def build_stage1_cmd(
         "--hf-repo",
         "liuhaotian/LLaVA-Pretrain",
         "--hf-file",
-        "blip_laion_cc_sbu_558k_meta.json",
+        "blip_laion_cc_sbu_558k.json",
+        "--hf-image-zip",
+        "images.zip",
         "--image-root",
         image_root,
         "--out-dir",
@@ -99,10 +100,9 @@ def build_stage1_cmd(
 
 
 def build_stage2_cmd(
-    init_checkpoint_dir: str = "/vol/checkpoints/stage1",
-    init_checkpoint_step: int = 1000,
+    init_checkpoint_dir: str = "",
+    init_checkpoint_step: int = 0,
     out_dir: str = "/vol/checkpoints/stage2",
-    image_root: str = "/vol/datasets/llava/coco/train2017",
     num_iterations: int = 1000,
     batch_size: int = 24,
     max_batch_tokens: int = 12000,
@@ -110,7 +110,8 @@ def build_stage2_cmd(
     run: str = "dummy",
     model_step: int = 650,
     profile_timing: bool = False,
-    image_url_template: str = COCO_TRAIN2017_IMAGE_URL,
+    hf_repo: str = "HuggingFaceM4/FineVision",
+    hf_config: str = "LLaVA_Instruct_150K",
 ):
     cmd = [
         "python",
@@ -121,17 +122,9 @@ def build_stage2_cmd(
         "--stage",
         "2",
         "--hf-repo",
-        "liuhaotian/LLaVA-Instruct-150K",
-        "--hf-file",
-        "llava_instruct_150k.json",
-        "--image-root",
-        image_root,
-        "--image-url-template",
-        image_url_template,
-        "--init-vlm-checkpoint-dir",
-        init_checkpoint_dir,
-        "--init-vlm-checkpoint-step",
-        str(init_checkpoint_step),
+        hf_repo,
+        "--hf-config",
+        hf_config,
         "--out-dir",
         out_dir,
         "--device-type",
@@ -149,6 +142,8 @@ def build_stage2_cmd(
         "--model-step",
         str(model_step),
     ]
+    if init_checkpoint_dir:
+        cmd += ["--init-vlm-checkpoint-dir", init_checkpoint_dir, "--init-vlm-checkpoint-step", str(init_checkpoint_step)]
     if max_examples > 0:
         cmd += ["--max-examples", str(max_examples)]
     if profile_timing:
@@ -260,10 +255,9 @@ def stage1(
 
 @app.function(gpu=GPU_TYPE, volumes={"/vol": VOL}, secrets=SECRETS, timeout=24 * 60 * 60)
 def stage2(
-    init_checkpoint_dir: str = "/vol/checkpoints/stage1",
-    init_checkpoint_step: int = 1000,
+    init_checkpoint_dir: str = "",
+    init_checkpoint_step: int = 0,
     out_dir: str = "/vol/checkpoints/stage2",
-    image_root: str = "/vol/datasets/llava/coco/train2017",
     num_iterations: int = 1000,
     batch_size: int = 24,
     max_batch_tokens: int = 12000,
@@ -271,13 +265,13 @@ def stage2(
     run: str = "dummy",
     model_step: int = 650,
     profile_timing: bool = False,
-    image_url_template: str = COCO_TRAIN2017_IMAGE_URL,
+    hf_repo: str = "HuggingFaceM4/FineVision",
+    hf_config: str = "LLaVA_Instruct_150K",
 ):
     _run(build_stage2_cmd(
         init_checkpoint_dir,
         init_checkpoint_step,
         out_dir,
-        image_root,
         num_iterations,
         batch_size,
         max_batch_tokens,
@@ -285,7 +279,8 @@ def stage2(
         run,
         model_step,
         profile_timing,
-        image_url_template,
+        hf_repo,
+        hf_config,
     ))
 
 

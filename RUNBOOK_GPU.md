@@ -1,7 +1,7 @@
 # nanochat-llava external GPU runbook
 
 This is the current short runbook for a rented GPU machine. It avoids Modal and
-uses streamed HF JSON plus on-demand image downloads where possible.
+uses streamed HF metadata/shards with local or embedded image bytes.
 
 ## Setup
 
@@ -27,16 +27,13 @@ PY
 
 ## Data download behavior
 
-Training metadata is streamed from Hugging Face by default. Do not pass
-`--no-stream-hf-data` for the cheap probe path.
+Training metadata is streamed from Hugging Face by default.
 
-- Stage 1 default: streams `blip_laion_cc_sbu_558k_meta.json`, then downloads
-  only the source images that are actually used by the run.
-- Stage 1 fallback: `--hf-image-zip images.zip` downloads the large HF image zip
-  once into the HF cache, but reads images directly from the zip without
-  extracting them.
-- Stage 2 default: streams `llava_instruct_150k.json`, then downloads only the
-  referenced COCO train2017 images.
+- Stage 1 default: streams `blip_laion_cc_sbu_558k.json` and reads images
+  directly from the HF `images.zip` cache file without extracting it.
+- Stage 2 default: streams `HuggingFaceM4/FineVision` config
+  `LLaVA_Instruct_150K`. Image bytes come from the HF dataset shards, so there
+  are no per-sample COCO URL downloads.
 
 The first run still downloads model weights once: `karpathy/nanochat-d32` and
 `google/siglip-base-patch16-512`.
@@ -49,29 +46,8 @@ VLM_SMOKE_DEVICE=cuda uv run --extra vision --extra gpu python -m pytest tests/t
 
 ## Stage 1 projector alignment
 
-Default no-upfront-download path. This streams the LLaVA-Pretrain meta JSON and
-downloads only referenced source images. Dead or slow image URLs are skipped.
-
-```bash
-uv run --extra vision --extra gpu python -m scripts.vlm_train \
-  --stage 1 \
-  --hf-repo liuhaotian/LLaVA-Pretrain \
-  --hf-file blip_laion_cc_sbu_558k_meta.json \
-  --image-root $DATA_ROOT/datasets/llava/pretrain_images \
-  --out-dir $DATA_ROOT/checkpoints/stage1_pixshuffle_250 \
-  --device-type cuda \
-  --num-iterations 250 \
-  --device-batch-size 32 \
-  --max-examples 16000 \
-  --max-seq-len 2048 \
-  --save-every 250 \
-  --model-step 650 \
-  --skip-bad-images
-```
-
-If source URLs are too slow or too many are dead, use the reliable HF zip
-fallback. It downloads `images.zip` once into the HF cache and reads from it
-without extracting.
+This streams LLaVA-Pretrain metadata and reads images directly from the HF
+`images.zip` cache file without extracting it.
 
 ```bash
 uv run --extra vision --extra gpu python -m scripts.vlm_train \
@@ -87,7 +63,8 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --max-examples 16000 \
   --max-seq-len 2048 \
   --save-every 250 \
-  --model-step 650
+  --model-step 650 \
+  --skip-bad-images
 ```
 
 ## Benchmark Stage 1 baseline
@@ -108,18 +85,18 @@ uv run --extra vision --extra gpu python -m scripts.vlm_eval \
 
 ## Stage 2 visual instruction probe
 
-This streams LLaVA-Instruct JSON and downloads only referenced COCO images.
+This streams the FineVision-packaged LLaVA-Instruct subset. It follows the
+nanoVLM-style `images` + `texts` schema and avoids per-image COCO URL fetches.
+This direct run skips Stage 1 projector alignment: nanochat starts from
+`karpathy/nanochat-d32`, the projector starts random, SigLIP stays frozen, and
+Stage 2 trains projector plus nanochat.
 
 ```bash
 uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --stage 2 \
-  --hf-repo liuhaotian/LLaVA-Instruct-150K \
-  --hf-file llava_instruct_150k.json \
-  --image-root $DATA_ROOT/datasets/llava/coco/train2017 \
-  --image-url-template 'http://images.cocodataset.org/train2017/{basename}' \
-  --init-vlm-checkpoint-dir $DATA_ROOT/checkpoints/stage1_pixshuffle_250 \
-  --init-vlm-checkpoint-step 250 \
-  --out-dir $DATA_ROOT/checkpoints/stage2_llava_probe \
+  --hf-repo HuggingFaceM4/FineVision \
+  --hf-config LLaVA_Instruct_150K \
+  --out-dir $DATA_ROOT/checkpoints/stage2_direct_finevision_probe \
   --device-type cuda \
   --num-iterations 100 \
   --device-batch-size 24 \
@@ -135,21 +112,21 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
 
 ```bash
 uv run --extra vision --extra gpu python -m scripts.vlm_eval \
-  --checkpoint-dir $DATA_ROOT/checkpoints/stage2_llava_probe \
+  --checkpoint-dir $DATA_ROOT/checkpoints/stage2_direct_finevision_probe \
   --checkpoint-step 100 \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
   --limit 16 \
   --max-scan 240 \
   --print-samples 3 \
   --control \
-  --out $DATA_ROOT/bench/stage2_llava_probe.json \
+  --out $DATA_ROOT/bench/stage2_direct_finevision_probe.json \
   --device-type cuda \
   --model-step 650
 ```
 
-Compare `stage1_pixshuffle_250.json` and `stage2_llava_probe.json`. The first
-useful signal is whether Stage 2 improves the subset scores and whether sample
-generations are image-relevant.
+Compare this eval against the text-only/base baseline or the previous Stage 1/2
+probe if available. The first useful signal is whether the subset scores improve
+and whether sample generations are image-relevant.
 
 ## Go/no-go criteria
 

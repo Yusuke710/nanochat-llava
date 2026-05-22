@@ -10,12 +10,11 @@ language model.
 """
 
 import argparse
+import io
 import json
 import os
 import random
-import socket
 import time
-import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -44,15 +43,33 @@ from nanochat.vision import (
 
 IMAGE_KEYS = ("image", "image_path", "filename", "path")
 DEFAULT_STAGE_DATA = {
-    1: ("liuhaotian/LLaVA-Pretrain", "blip_laion_cc_sbu_558k_meta.json"),
-    2: ("liuhaotian/LLaVA-Instruct-150K", "llava_instruct_150k.json"),
+    1: ("liuhaotian/LLaVA-Pretrain", "blip_laion_cc_sbu_558k.json"),
+    2: ("HuggingFaceM4/FineVision", None),
 }
+DEFAULT_STAGE_CONFIG = {2: "LLaVA_Instruct_150K"}
 MODEL_SOURCE = "sft"
 UNTRUNCATED_MAX_TOKENS = 1_000_000_000
-IMAGE_DOWNLOAD_TIMEOUT = 10.0
 INIT_LR_FRAC = 0.05
 WARMDOWN_RATIO = 0.5
 _ZIP_CACHE = {}
+PROFILE_KEYS = (
+    "data",
+    "image_open",
+    "image_processor",
+    "image_transfer",
+    "siglip_forward",
+    "siglip_pool",
+    "image_siglip",
+    "batch",
+    "fwdbwd",
+    "optim",
+)
+IMAGE_PROFILE_KEYS = ("image_open", "image_processor", "image_transfer", "siglip_forward", "siglip_pool")
+
+
+def add_profile(profile, key, elapsed):
+    if profile is not None:
+        profile[key] += elapsed
 
 
 def _first_assistant_text(example):
@@ -67,6 +84,17 @@ def _first_assistant_text(example):
 def _ensure_image_marker_in_conversation(example):
     example = dict(example)
     conv = example.get("conversations") or example.get("messages")
+    if conv is None and example.get("texts") is not None:
+        conv = []
+        for text in example["texts"]:
+            user = text.get("user", "")
+            assistant = text.get("assistant", "")
+            if user or assistant:
+                conv.extend([{"role": "user", "content": user}, {"role": "assistant", "content": assistant}])
+        if conv:
+            example["messages"] = conv
+        else:
+            conv = None
     if conv is None:
         question = example.get("question", "Describe the image.")
         answer = example.get("answer", example.get("caption", ""))
@@ -106,6 +134,21 @@ def _iter_hf_json_records(hf_repo: str, hf_file: str):
     yield from load_dataset("json", data_files=data_files, split="train", streaming=True)
 
 
+def _iter_hf_dataset_records(hf_repo: str, hf_config: str):
+    from datasets import load_dataset
+
+    ds = load_dataset(hf_repo, hf_config, split="train", streaming=True)
+    try:
+        from datasets import Image as HFImage
+        from datasets import Sequence
+
+        if "images" in (getattr(ds, "features", None) or {}):
+            ds = ds.cast_column("images", Sequence(HFImage(decode=False)))
+    except ImportError:
+        pass
+    yield from ds
+
+
 def _stream_record_limit(args):
     if args.max_examples > 0:
         return args.max_examples
@@ -121,19 +164,22 @@ def load_records(args):
             records = records[: args.max_examples]
         return records, str(path)
 
-    hf_repo, hf_file = args.hf_repo, args.hf_file
-    if not hf_repo and not hf_file:
+    hf_repo, hf_file, hf_config = args.hf_repo, args.hf_file, getattr(args, "hf_config", None)
+    if not hf_repo and not hf_file and not hf_config:
         hf_repo, hf_file = DEFAULT_STAGE_DATA[args.stage]
-    assert hf_repo and hf_file, "provide --data-json or --hf-repo plus --hf-file"
+        hf_config = DEFAULT_STAGE_CONFIG.get(args.stage)
+    assert hf_repo and (hf_file or hf_config), "provide --data-json, --hf-repo plus --hf-file, or --hf-repo plus --hf-config"
 
     limit = _stream_record_limit(args)
     records = []
-    for rec in _iter_hf_json_records(hf_repo, hf_file):
+    source = f"stream:{hf_repo}/{hf_file or hf_config}"
+    iterator = _iter_hf_dataset_records(hf_repo, hf_config) if hf_config else _iter_hf_json_records(hf_repo, hf_file)
+    for rec in iterator:
         records.append(rec)
         if len(records) >= limit:
             break
-    assert records, f"streamed no records from {hf_repo}/{hf_file}"
-    return records, f"stream:{hf_repo}/{hf_file} first {len(records):,} rows"
+    assert records, f"streamed no records from {hf_repo}/{hf_file or hf_config}"
+    return records, f"{source} first {len(records):,} rows"
 
 
 def maybe_use_hf_image_zip(args):
@@ -149,6 +195,11 @@ def maybe_use_hf_image_zip(args):
 
 
 def _image_value(record):
+    images = record.get("images")
+    if images:
+        if isinstance(images, list) and len(images) == 1:
+            return images[0]
+        return None
     for key in IMAGE_KEYS:
         value = record.get(key)
         if value is not None:
@@ -226,59 +277,48 @@ def resolve_image_path(value, image_root):
     raise FileNotFoundError(f"could not find image {value!r} under {image_root!r}")
 
 
-def download_image_to_cache(value, image_root, image_url_template=None, image_url=None):
-    assert image_root, "--image-url-template requires --image-root"
-    root = Path(image_root)
-    root.mkdir(parents=True, exist_ok=True)
-    raw = str(value).replace("\\", "/").lstrip("/")
-    while raw.startswith("./"):
-        raw = raw[2:]
-    target = (root / raw).resolve()
-    if not target.is_relative_to(root.resolve()):
-        raise ValueError(f"unsafe image path: {value}")
-    if target.exists():
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    basename = raw.rsplit("/", 1)[-1]
-    url = image_url or image_url_template.format(path=raw, basename=basename)
-    tmp = target.with_name(target.name + ".tmp")
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(IMAGE_DOWNLOAD_TIMEOUT)
-    try:
-        urllib.request.urlretrieve(url, tmp)
-        tmp.replace(target)
-    finally:
-        socket.setdefaulttimeout(old_timeout)
-        if tmp.exists():
-            tmp.unlink()
-    return target
-
-
-def open_image(record, image_root, image_zip=None, image_url_template=None):
+def open_image(record, image_root, image_zip=None, profile=None):
     value = _image_value(record)
     if value is None:
         raise KeyError(f"record has no image field among {IMAGE_KEYS}")
     if hasattr(value, "convert"):
-        return value.convert("RGB")
+        t = time.perf_counter()
+        image = value.convert("RGB")
+        add_profile(profile, "image_open", time.perf_counter() - t)
+        return image
 
     from PIL import Image
 
+    if isinstance(value, dict):
+        t = time.perf_counter()
+        if value.get("bytes") is not None:
+            with Image.open(io.BytesIO(value["bytes"])) as img:
+                image = img.convert("RGB")
+        elif value.get("path"):
+            with Image.open(value["path"]) as img:
+                image = img.convert("RGB")
+        else:
+            raise ValueError("HF image dict has neither bytes nor path")
+        add_profile(profile, "image_open", time.perf_counter() - t)
+        return image
+
     try:
         path = resolve_image_path(value, image_root)
+        t = time.perf_counter()
         with Image.open(path) as img:
-            return img.convert("RGB")
+            image = img.convert("RGB")
+        add_profile(profile, "image_open", time.perf_counter() - t)
+        return image
     except FileNotFoundError as local_error:
-        image_url = record.get("url") or record.get("image_url")
-        if image_url or image_url_template:
-            path = download_image_to_cache(value, image_root, image_url_template, image_url=image_url)
-            with Image.open(path) as img:
-                return img.convert("RGB")
         if image_zip:
+            t = time.perf_counter()
             entry = get_zip_file(image_zip)
             member = resolve_image_in_zip(value, image_zip)
             with entry["zip"].open(member) as f:
                 with Image.open(f) as img:
-                    return img.convert("RGB")
+                    image = img.convert("RGB")
+            add_profile(profile, "image_open", time.perf_counter() - t)
+            return image
         raise local_error
 
 
@@ -342,13 +382,13 @@ def next_batch(examples, batch_size, cursor, rng, max_batch_tokens=0):
     return batch, cursor
 
 
-def batch_features_and_examples(extractor, examples, image_root, image_zip=None, image_url_template=None, skip_bad_images=False):
+def batch_features_and_examples(extractor, examples, image_root, image_zip=None, skip_bad_images=False, profile=None, synchronize=None):
     images = []
     kept_examples = []
     for i, example in enumerate(examples):
         record = example["record"]
         try:
-            images.append(open_image(record, image_root, image_zip=image_zip, image_url_template=image_url_template))
+            images.append(open_image(record, image_root, image_zip=image_zip, profile=profile))
             kept_examples.append(example)
         except Exception as exc:
             if not skip_bad_images:
@@ -356,7 +396,9 @@ def batch_features_and_examples(extractor, examples, image_root, image_zip=None,
             print0(f"skipping image {record.get('image', record.get('id', i))}: {type(exc).__name__}: {exc}")
     if not images:
         return None, kept_examples
-    return extractor(images), kept_examples
+    if profile is None:
+        return extractor(images), kept_examples
+    return extractor(images, profile=profile, synchronize=synchronize), kept_examples
 
 
 def count_params(parameters):
@@ -409,7 +451,7 @@ def freeze_value_embedding_path(model):
                 p.requires_grad = False
 
 
-def control_losses(model, projector, extractor, examples, image_root, image_zip, image_url_template, device, batch_size=4, step=1, skip_bad_images=False):
+def control_losses(model, projector, extractor, examples, image_root, image_zip, device, batch_size=4, step=1, skip_bad_images=False):
     count = min(max(batch_size, 0), len(examples))
     start = ((max(step, 1) - 1) * count) % len(examples) if count > 0 else 0
     batch = [examples[(start + i) % len(examples)] for i in range(count)]
@@ -420,7 +462,6 @@ def control_losses(model, projector, extractor, examples, image_root, image_zip,
         batch,
         image_root,
         image_zip=image_zip,
-        image_url_template=image_url_template,
         skip_bad_images=skip_bad_images,
     )
     if feats is None or len(batch) < 2:
@@ -450,14 +491,13 @@ def save_training_checkpoint(out_dir, step, model, projector, args, model_meta, 
             "data_json": getattr(args, "data_json", None),
             "hf_repo": getattr(args, "hf_repo", None),
             "hf_file": getattr(args, "hf_file", None),
+            "hf_config": getattr(args, "hf_config", None),
             "stream_hf_data": True,
             "max_examples": getattr(args, "max_examples", None),
             "image_root": getattr(args, "image_root", None),
             "image_zip": getattr(args, "image_zip", None),
             "hf_image_zip": getattr(args, "hf_image_zip", None),
-            "image_url_template": getattr(args, "image_url_template", None),
             "skip_bad_images": getattr(args, "skip_bad_images", None),
-            "image_download_timeout": IMAGE_DOWNLOAD_TIMEOUT,
         },
         "vision_config": {
             "siglip_model_id": args.siglip_model_id,
@@ -482,15 +522,11 @@ def main():
     parser.add_argument("--data-json", default=None, help="local LLaVA-style JSON/JSONL")
     parser.add_argument("--hf-repo", default=None, help="Hugging Face dataset repo containing --hf-file")
     parser.add_argument("--hf-file", default=None, help="JSON/JSONL file inside --hf-repo")
+    parser.add_argument("--hf-config", default=None, help="Hugging Face dataset config to stream directly, e.g. FineVision LLaVA_Instruct_150K")
     parser.add_argument("--hf-image-zip", default=None, help="optional image zip inside --hf-repo")
     parser.add_argument("--image-zip", default=None, help="local zip containing referenced images")
     parser.add_argument("--image-root", default=None, help="directory containing referenced images")
-    parser.add_argument(
-        "--image-url-template",
-        default=None,
-        help="download missing images on demand; format with {basename} or {path}, e.g. COCO train2017 URL",
-    )
-    parser.add_argument("--skip-bad-images", action=argparse.BooleanOptionalAction, default=False, help="skip records whose image cannot be opened/downloaded")
+    parser.add_argument("--skip-bad-images", action=argparse.BooleanOptionalAction, default=False, help="skip records whose image cannot be opened")
     parser.add_argument("--max-examples", type=int, default=-1)
     parser.add_argument("--siglip-model-id", default=SIGLIP_MODEL_ID)
     parser.add_argument("--siglip-cache-dir", default=None, help="optional HF cache dir for SigLIP weights")
@@ -506,7 +542,7 @@ def main():
     parser.add_argument("--projector-lr", type=float, default=2e-3)
     parser.add_argument("--save-every", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--profile-timing", action="store_true", help="log coarse per-step timing for image+SigLIP vs LLM work")
+    parser.add_argument("--profile-timing", action="store_true", help="log per-step image decode/processor/SigLIP and LLM timing")
     parser.add_argument("--control-batch-size", type=int, default=4)
     parser.add_argument("--control-margin", type=float, default=0.01)
     parser.add_argument("--out-dir", default=None)
@@ -536,9 +572,13 @@ def main():
     args.warmdown_ratio = WARMDOWN_RATIO
     args.final_lr_frac = 0.0
     args.weight_decay = 0.0
+    t = time.perf_counter()
     records, data_path = load_records(args)
+    print0(f"Loaded {len(records):,} records in {time.perf_counter() - t:.2f}s")
     maybe_use_hf_image_zip(args)
+    t = time.perf_counter()
     examples = render_records(records, tokenizer, args.stage, args.max_seq_len)
+    print0(f"Rendered {len(examples):,} usable examples in {time.perf_counter() - t:.2f}s")
 
     siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
     extractor = SigLIPPooledFeatureExtractor(args.siglip_model_id, device=device, cache_dir=siglip_cache_dir, verbose=ddp_rank == 0)
@@ -590,7 +630,7 @@ def main():
     for step in range(1, args.num_iterations + 1):
         synchronize()
         t0 = time.perf_counter()
-        profile = {"data": 0.0, "image_siglip": 0.0, "batch": 0.0, "fwdbwd": 0.0, "optim": 0.0}
+        profile = {key: 0.0 for key in PROFILE_KEYS}
         train_loss = None
         projector_optimizer.zero_grad(set_to_none=True)
         if llm_optimizer is not None:
@@ -612,8 +652,9 @@ def main():
                 batch_examples,
                 args.image_root,
                 image_zip=args.image_zip,
-                image_url_template=args.image_url_template,
                 skip_bad_images=args.skip_bad_images,
+                profile=profile if args.profile_timing else None,
+                synchronize=synchronize if args.profile_timing else None,
             )
             if feats is not None:
                 feats = feats.to(device=device, non_blocking=True)
@@ -623,7 +664,8 @@ def main():
             masks = [ex["mask"] for ex in batch_examples]
             if args.profile_timing:
                 synchronize()
-            profile["image_siglip"] += time.perf_counter() - t
+            image_elapsed = time.perf_counter() - t
+            profile["image_siglip"] += image_elapsed if not args.profile_timing else 0.0
 
             t = time.perf_counter()
             batch = build_multimodal_batch(model, projector, rows, feats, loss_mask_rows=masks, max_seq_len=args.max_seq_len, value_fallback_token_id=rows[0][0])
@@ -665,6 +707,8 @@ def main():
         tokens_per_sec = tokens_this_step / max(dt, 1e-9)
         flops_per_sec = num_flops_per_token * tokens_this_step / max(dt, 1e-9)
         mfu = 100 * flops_per_sec / gpu_peak_flops
+        if args.profile_timing:
+            profile["image_siglip"] = sum(profile[key] for key in IMAGE_PROFILE_KEYS)
         if step == 1 or step % args.log_every == 0 or step == args.num_iterations:
             controls = control_losses(
                 model,
@@ -673,7 +717,6 @@ def main():
                 examples,
                 args.image_root,
                 args.image_zip,
-                args.image_url_template,
                 device,
                 batch_size=args.control_batch_size,
                 step=step,
@@ -692,8 +735,10 @@ def main():
             }
             if args.profile_timing:
                 profile_str = (
-                    " | timing data/image+siglip/batch/fwdbwd/optim "
-                    f"{profile['data']:.3f}/{profile['image_siglip']:.3f}/"
+                    " | timing data/image_total/open/processor/h2d/siglip/pool/batch/fwdbwd/optim "
+                    f"{profile['data']:.3f}/{profile['image_siglip']:.3f}/{profile['image_open']:.3f}/"
+                    f"{profile['image_processor']:.3f}/{profile['image_transfer']:.3f}/"
+                    f"{profile['siglip_forward']:.3f}/{profile['siglip_pool']:.3f}/"
                     f"{profile['batch']:.3f}/{profile['fwdbwd']:.3f}/{profile['optim']:.3f}s"
                 )
                 log_data.update({f"timing/{k}_sec": v for k, v in profile.items()})

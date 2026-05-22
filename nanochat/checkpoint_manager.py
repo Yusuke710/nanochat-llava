@@ -9,7 +9,7 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, has_ve
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -30,14 +30,45 @@ def _patch_missing_config_keys(model_config_kwargs):
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     n_layer = model_config.n_layer
+    embedding_ref = model_data["transformer.wte.weight"]
+    matrix_ref = model_data.get("lm_head.weight", embedding_ref)
+    device = embedding_ref.device
+    embedding_dtype = embedding_ref.dtype
+    matrix_dtype = matrix_ref.dtype
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
+        model_data["resid_lambdas"] = torch.ones(n_layer, device=device, dtype=matrix_dtype)
         log0(f"Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        model_data["x0_lambdas"] = torch.zeros(n_layer, device=device, dtype=matrix_dtype)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # Newer GPT variants added smear/backout and value-embedding parameters. For
+    # old checkpoints, patch them to neutral values so loading preserves logits.
+    neutral_scalars = {
+        "smear_lambda": (1,),
+        "backout_lambda": (1,),
+        "smear_gate.weight": (1, 24),
+    }
+    for key, shape in neutral_scalars.items():
+        if key not in model_data:
+            model_data[key] = torch.zeros(shape, device=device, dtype=matrix_dtype)
+            log0(f"Patching missing {key} in model data to 0.0")
+
+    padded_vocab_size = model_data["transformer.wte.weight"].shape[0]
+    head_dim = model_config.n_embd // model_config.n_head
+    kv_dim = model_config.n_kv_head * head_dim
+    for layer_idx in range(n_layer):
+        if not has_ve(layer_idx, n_layer):
+            continue
+        ve_key = f"value_embeds.{layer_idx}.weight"
+        if ve_key not in model_data:
+            model_data[ve_key] = torch.zeros((padded_vocab_size, kv_dim), device=device, dtype=embedding_dtype)
+            log0(f"Patching missing {ve_key} in model data to 0.0")
+        gate_key = f"transformer.h.{layer_idx}.attn.ve_gate.weight"
+        if gate_key not in model_data:
+            model_data[gate_key] = torch.zeros((model_config.n_kv_head, 12), device=device, dtype=matrix_dtype)
+            log0(f"Patching missing {gate_key} in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:

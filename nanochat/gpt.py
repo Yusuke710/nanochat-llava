@@ -389,23 +389,27 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
+        # Build param_groups with all required fields explicit. Filter for
+        # requires_grad so downstream finetunes can freeze compatibility params
+        # without handing None gradients to grouped Muon updates.
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=[p for p in lm_head_params if p.requires_grad], lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=[p for p in embedding_params if p.requires_grad], lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            dict(kind='adamw', params=[p for p in value_embeds_params if p.requires_grad], lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=[p for p in resid_params if p.requires_grad], lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            dict(kind='adamw', params=[p for p in x0_params if p.requires_grad], lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            dict(kind='adamw', params=[p for p in smear_params if p.requires_grad], lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        trainable_matrix_params = [p for p in matrix_params if p.requires_grad]
+        for shape in sorted({p.shape for p in trainable_matrix_params}):
+            group_params = [p for p in trainable_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
+        param_groups = [group for group in param_groups if group["params"]]
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
@@ -413,19 +417,27 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', input_embeds=None, value_token_ids=None):
+        if input_embeds is None:
+            B, T = idx.size()
+        else:
+            B, T, C = input_embeds.size()
+            assert C == self.config.n_embd, f"input_embeds last dim {C} != n_embd {self.config.n_embd}"
+            assert idx is not None or value_token_ids is not None, "idx or value_token_ids required with input_embeds"
+        idx_for_values = idx if value_token_ids is None else value_token_ids
+        assert idx_for_values is not None, "value token ids are required"
+        assert idx_for_values.shape == (B, T), f"value token ids shape {idx_for_values.shape} != {(B, T)}"
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert idx_for_values.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx_for_values.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        x = self.transformer.wte(idx) if input_embeds is None else input_embeds # embed current token or use prebuilt multimodal embeddings
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -455,7 +467,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](idx_for_values).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x

@@ -11,3 +11,5 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+.modal_bench
+stage2_memorization_set/

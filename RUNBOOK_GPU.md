@@ -130,6 +130,28 @@ Compare this eval against the text-only/base baseline or the previous Stage 1/2
 probe if available. The first useful signal is whether the subset scores improve
 and whether sample generations are image-relevant.
 
+## Scaled Training Tracking
+
+Karpathy-style tracking for a longer Stage 2 run is:
+
+- `val_bpb`: held-out VLM answer-token BPB on a local validation JSON.
+- `eval/mean_score`: benchmark generation accuracy every 2000 steps, capped at
+  500 examples per benchmark.
+
+Add these args to the Stage 2 command when the held-out set is available on the
+machine:
+
+```bash
+  --val-json stage2_memorization_set/heldout.json \
+  --val-image-root stage2_memorization_set \
+  --val-bpb-every 200 \
+  --val-bpb-examples 100 \
+  --eval-every 2000 \
+  --eval-limit 500 \
+  --eval-max-scan 4000 \
+  --eval-print-samples 3
+```
+
 ## Go/no-go criteria
 
 Use this cheap probe as a gate before spending on longer LLaVA training:

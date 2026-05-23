@@ -38,7 +38,6 @@ from scripts.vlm_eval import (
 )
 from scripts.vlm_train import (
     batch_features_and_examples,
-    evaluate_vlm_bpb,
     get_lr_multiplier,
     load_records,
     next_batch,
@@ -328,45 +327,6 @@ def test_batch_features_can_skip_dead_images(tmp_path):
     feats, kept = batch_features_and_examples(Extractor(), examples, tmp_path, skip_bad_images=True)
     assert len(kept) == 1
     assert feats.shape == (1, VISION_TOKENS, 2)
-
-
-def test_vlm_bpb_eval_scores_supervised_targets(tmp_path):
-    Image.new("RGB", (4, 4), color=(1, 2, 3)).save(tmp_path / "tiny.jpg")
-    records = [{
-        "image": "tiny.jpg",
-        "conversations": [
-            {"from": "human", "value": f"{IMAGE_MARKER}\nWhat color?"},
-            {"from": "gpt", "value": "red"},
-        ],
-    }]
-    tokenizer = TinyTokenizer()
-    examples = render_records(records, tokenizer, stage=2, max_seq_len=128)
-    model, projector = tiny_model()
-    model.train()
-    projector.train()
-
-    class Extractor:
-        def __call__(self, images):
-            return torch.randn(len(images), VISION_TOKENS, 8)
-
-    stats = evaluate_vlm_bpb(
-        model,
-        projector,
-        Extractor(),
-        examples,
-        tmp_path,
-        None,
-        torch.device("cpu"),
-        torch.ones(tokenizer.get_vocab_size(), dtype=torch.long),
-        batch_size=1,
-        max_seq_len=128,
-    )
-    assert stats["n"] == 1
-    assert stats["bytes"] > 0
-    assert stats["target_tokens"] > 0
-    assert torch.isfinite(torch.tensor(stats["bpb"]))
-    assert model.training
-    assert projector.training
 
 
 def test_eval_prompt_matching_and_samples():

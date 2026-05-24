@@ -12,6 +12,7 @@ language model.
 import argparse
 import io
 import json
+import math
 import os
 import random
 import time
@@ -23,6 +24,7 @@ import wandb
 
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import DummyWandb, autodetect_device_type, compute_cleanup, compute_init, get_base_dir, get_peak_flops, print0
+from nanochat.tokenizer import get_token_bytes
 from nanochat.vision import (
     IMAGE_MARKER,
     IMAGE_TOKEN_ID,
@@ -480,6 +482,58 @@ def control_losses(model, projector, extractor, examples, image_root, image_zip,
     return float(aligned), float(shuffled), float(no_image)
 
 
+def evaluate_vlm_bpb(model, projector, extractor, examples, image_root, image_zip, device, token_bytes, batch_size=4, max_examples=-1, max_seq_len=2048, skip_bad_images=False):
+    limit = len(examples) if max_examples <= 0 else min(max_examples, len(examples))
+    model_was_training = model.training
+    projector_was_training = projector.training
+    model.eval()
+    projector.eval()
+    total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    total_targets = torch.tensor(0, dtype=torch.int64, device=device)
+    seen = 0
+    try:
+        with torch.no_grad():
+            for start in range(0, limit, batch_size):
+                batch_examples = examples[start : start + batch_size]
+                feats, batch_examples = batch_features_and_examples(
+                    extractor,
+                    batch_examples,
+                    image_root,
+                    image_zip=image_zip,
+                    skip_bad_images=skip_bad_images,
+                )
+                if feats is None or not batch_examples:
+                    continue
+                feats = feats.to(device=device, non_blocking=True)
+                rows = [ex["tokens"] for ex in batch_examples]
+                masks = [ex["mask"] for ex in batch_examples]
+                batch = build_multimodal_batch(model, projector, rows, feats, loss_mask_rows=masks, max_seq_len=max_seq_len, value_fallback_token_id=rows[0][0])
+                loss = model(batch.value_token_ids, batch.targets, input_embeds=batch.input_embeds, loss_reduction="none").view(-1)
+                targets = batch.targets.view(-1)
+                valid = targets >= 0
+                safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
+                num_bytes = torch.where(valid, token_bytes[safe_targets], torch.zeros_like(targets, dtype=token_bytes.dtype))
+                counted = num_bytes > 0
+                total_nats += (loss * counted).sum()
+                total_bytes += num_bytes.sum()
+                total_targets += counted.sum()
+                seen += len(batch_examples)
+    finally:
+        model.train(model_was_training)
+        projector.train(projector_was_training)
+    bytes_f = int(total_bytes.item())
+    nats_f = float(total_nats.item())
+    targets_i = int(total_targets.item())
+    return {
+        "bpb": nats_f / (math.log(2) * bytes_f) if bytes_f > 0 else float("inf"),
+        "loss": nats_f / max(targets_i, 1),
+        "n": seen,
+        "bytes": bytes_f,
+        "target_tokens": targets_i,
+    }
+
+
 def save_training_checkpoint(out_dir, step, model, projector, args, model_meta, data_path, rank=0):
     meta = {
         "step": step,
@@ -541,13 +595,19 @@ def main():
     parser.add_argument("--num-iterations", type=int, default=1000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--projector-lr", type=float, default=2e-3)
-    parser.add_argument("--eval-every", type=int, default=-1, help="run small VLM benchmark eval every N steps (-1 = disable)")
-    parser.add_argument("--eval-benchmarks", default="mmstar,scienceqa,chartqa,mmmu,textvqa")
-    parser.add_argument("--eval-mmmu-configs", default="Accounting")
-    parser.add_argument("--eval-limit", type=int, default=16)
-    parser.add_argument("--eval-max-scan", type=int, default=240)
-    parser.add_argument("--eval-max-new-tokens", type=int, default=16)
-    parser.add_argument("--eval-print-samples", type=int, default=0)
+    parser.add_argument("--val-json", default=None, help="local held-out VLM JSON for validation BPB")
+    parser.add_argument("--val-image-root", default=None, help="image root for --val-json; defaults to the JSON parent directory")
+    parser.add_argument("--val-image-zip", default=None, help="optional image zip for --val-json")
+    parser.add_argument("--eval-every", type=int, default=-1, help="evaluate held-out VLM BPB every N steps (-1 = disable)")
+    parser.add_argument("--eval-examples", type=int, default=-1, help="held-out examples to score for BPB (-1 = all)")
+    parser.add_argument("--eval-batch-size", type=int, default=4, help="batch size for held-out VLM BPB")
+    parser.add_argument("--vlmcore-every", type=int, default=-1, help="run VLMCORE benchmark subset every N steps (-1 = disable)")
+    parser.add_argument("--vlmcore-benchmarks", default="mmstar,scienceqa,chartqa,mmmu,textvqa")
+    parser.add_argument("--vlmcore-mmmu-configs", default="Accounting")
+    parser.add_argument("--vlmcore-max-per-benchmark", type=int, default=100)
+    parser.add_argument("--vlmcore-max-scan", type=int, default=2000)
+    parser.add_argument("--vlmcore-max-new-tokens", type=int, default=16)
+    parser.add_argument("--vlmcore-print-samples", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--profile-timing", action="store_true", help="log per-step image decode/processor/SigLIP and LLM timing")
@@ -558,6 +618,8 @@ def main():
     parser.add_argument("--init-vlm-checkpoint-step", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.eval_every > 0 and not args.val_json:
+        parser.error("--eval-every requires --val-json")
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _, ddp_rank, _, ddp_world_size, device = compute_init(device_type)
@@ -587,6 +649,17 @@ def main():
     t = time.perf_counter()
     examples = render_records(records, tokenizer, args.stage, args.max_seq_len)
     print0(f"Rendered {len(examples):,} usable examples in {time.perf_counter() - t:.2f}s")
+    val_examples = None
+    val_image_root = None
+    if args.val_json:
+        val_path = Path(args.val_json)
+        val_image_root = args.val_image_root or str(val_path.parent)
+        val_records = _load_json(val_path)
+        assert isinstance(val_records, list), f"expected a JSON list in {val_path}"
+        val_examples = render_records(val_records, tokenizer, args.stage, args.max_seq_len)
+        if args.eval_examples > 0:
+            val_examples = val_examples[: args.eval_examples]
+        print0(f"Rendered {len(val_examples):,} held-out validation examples from {val_path}")
 
     siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
     extractor = SigLIPPooledFeatureExtractor(args.siglip_model_id, device=device, cache_dir=siglip_cache_dir, verbose=ddp_rank == 0)
@@ -622,6 +695,7 @@ def main():
     num_flops_per_token = model.estimate_flops()
     total_params = count_params(model.parameters()) + count_params(projector.parameters())
     total_trainable = count_params(p for p in list(model.parameters()) + list(projector.parameters()) if p.requires_grad)
+    token_bytes = get_token_bytes(device=device) if val_examples is not None else None
     print0(f"VLM stage {args.stage} | GPU: {gpu_name} | examples: {len(examples):,} | data: {data_path} | out: {out_dir}", flush=True)
     print0(f"Params total/trainable: {total_params:,}/{total_trainable:,}")
     print0(f"Estimated LLM FLOPs/token: {num_flops_per_token:e} | Peak BF16 FLOPS: {gpu_peak_flops:.2e}")
@@ -634,6 +708,66 @@ def main():
     print0(f"Allocated memory after setup: {setup_mem_mib:.2f}MiB")
     if device_type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+
+    min_val_bpb = float("inf")
+
+    def run_val_bpb(step):
+        nonlocal min_val_bpb
+        val_stats = evaluate_vlm_bpb(
+            model,
+            projector,
+            extractor,
+            val_examples,
+            val_image_root,
+            args.val_image_zip,
+            device,
+            token_bytes,
+            batch_size=args.eval_batch_size,
+            max_examples=args.eval_examples,
+            max_seq_len=args.max_seq_len,
+            skip_bad_images=args.skip_bad_images,
+        )
+        min_val_bpb = min(min_val_bpb, val_stats["bpb"])
+        print0(
+            f"step {step:05d}/{args.num_iterations:05d} | val_bpb {val_stats['bpb']:.4f} | "
+            f"min_val_bpb {min_val_bpb:.4f} | val_loss {val_stats['loss']:.4f} | val_examples {val_stats['n']}",
+            flush=True,
+        )
+        wandb_run.log({
+            "step": step,
+            "val/bpb": val_stats["bpb"],
+            "val/min_bpb": min_val_bpb,
+            "val/loss": val_stats["loss"],
+            "val/examples": val_stats["n"],
+            "val/bytes": val_stats["bytes"],
+            "val/target_tokens": val_stats["target_tokens"],
+        })
+
+    def run_vlmcore(step):
+        results = evaluate_vlm(
+            model,
+            projector,
+            tokenizer,
+            extractor,
+            benchmarks=args.vlmcore_benchmarks,
+            mmmu_configs=args.vlmcore_mmmu_configs,
+            limit=args.vlmcore_max_per_benchmark,
+            max_scan=args.vlmcore_max_scan,
+            max_new_tokens=args.vlmcore_max_new_tokens,
+            print_samples=args.vlmcore_print_samples,
+        )
+        scores = {key: row["score"] for key, row in results["benchmarks"].items()}
+        mean_score = sum(scores.values()) / max(len(scores), 1)
+        score_str = " ".join(f"{key}={score:.3f}" for key, score in scores.items())
+        print0(f"step {step:05d}/{args.num_iterations:05d} | VLMCORE {mean_score:.4f} | {score_str}", flush=True)
+        wandb_run.log({
+            "step": step,
+            "vlmcore/mean_score": mean_score,
+            **{f"vlmcore/{key}_score": score for key, score in scores.items()},
+        })
+
+    if args.eval_every > 0:
+        run_val_bpb(0)
 
     for step in range(1, args.num_iterations + 1):
         synchronize()
@@ -768,27 +902,9 @@ def main():
             )
             wandb_run.log(log_data)
         if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.num_iterations):
-            eval_results = evaluate_vlm(
-                model,
-                projector,
-                tokenizer,
-                extractor,
-                benchmarks=args.eval_benchmarks,
-                mmmu_configs=args.eval_mmmu_configs,
-                limit=args.eval_limit,
-                max_scan=args.eval_max_scan,
-                max_new_tokens=args.eval_max_new_tokens,
-                print_samples=args.eval_print_samples,
-            )
-            eval_scores = {key: row["score"] for key, row in eval_results["benchmarks"].items()}
-            eval_mean = sum(eval_scores.values()) / max(len(eval_scores), 1)
-            score_str = " ".join(f"{key}={score:.3f}" for key, score in eval_scores.items())
-            print0(f"step {step:05d}/{args.num_iterations:05d} | vlm_eval_mean {eval_mean:.4f} | {score_str}", flush=True)
-            wandb_run.log({
-                "step": step,
-                "eval/mean_score": eval_mean,
-                **{f"eval/{key}_score": score for key, score in eval_scores.items()},
-            })
+            run_val_bpb(step)
+        if args.vlmcore_every > 0 and (step % args.vlmcore_every == 0 or step == args.num_iterations):
+            run_vlmcore(step)
         if args.save_every > 0 and step % args.save_every == 0:
             save_training_checkpoint(out_dir, step, model, projector, args, meta, data_path, rank=ddp_rank)
 

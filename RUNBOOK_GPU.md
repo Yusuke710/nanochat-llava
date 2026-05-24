@@ -105,10 +105,19 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --save-every 100 \
   --model-step 650 \
   --profile-timing \
+  --vlmcore-every 100 \
+  --vlmcore-max-per-benchmark 16 \
+  --vlmcore-max-scan 240 \
+  --vlmcore-print-samples 3
+```
+
+If the fixed local held-out set is present on the machine, add validation BPB:
+
+```bash
+  --val-json stage2_memorization_set/heldout.json \
+  --val-image-root stage2_memorization_set \
   --eval-every 100 \
-  --eval-limit 16 \
-  --eval-max-scan 240 \
-  --eval-print-samples 3
+  --eval-examples 100
 ```
 
 ## Benchmark Stage 2
@@ -129,6 +138,27 @@ uv run --extra vision --extra gpu python -m scripts.vlm_eval \
 Compare this eval against the text-only/base baseline or the previous Stage 1/2
 probe if available. The first useful signal is whether the subset scores improve
 and whether sample generations are image-relevant.
+
+## Train-Time Eval
+
+`vlm_train.py` follows the same split as nanochat SFT:
+
+- `--eval-every`: fixed held-out validation BPB/loss from `--val-json`.
+- `--vlmcore-every`: fixed benchmark generation subset from MMStar, ScienceQA,
+  ChartQA, MMMU, and TextVQA.
+
+For scaled tracking with roughly 500 benchmark examples every 2000 steps:
+
+```bash
+  --val-json stage2_memorization_set/heldout.json \
+  --val-image-root stage2_memorization_set \
+  --eval-every 200 \
+  --eval-examples 100 \
+  --vlmcore-every 2000 \
+  --vlmcore-max-per-benchmark 100 \
+  --vlmcore-max-scan 2000 \
+  --vlmcore-print-samples 3
+```
 
 ## Go/no-go criteria
 

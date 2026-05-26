@@ -142,11 +142,19 @@ class SigLIPPooledFeatureExtractor:
             print(f"Loaded SigLIP vision model patch_dim={self.patch_dim} projected_feature_dim={self.vision_dim}", flush=True)
 
     @torch.no_grad()
-    def __call__(self, images) -> torch.Tensor:
+    def preprocess(self, images) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(device=self.device, dtype=self.dtype)
+        return inputs["pixel_values"]
+
+    @torch.no_grad()
+    def encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype, non_blocking=self.device.type == "cuda")
         out = self.model(pixel_values=pixel_values)
         return pool_siglip_features(out.last_hidden_state, output_grid=self.output_grid)
+
+    @torch.no_grad()
+    def __call__(self, images) -> torch.Tensor:
+        return self.encode_pixel_values(self.preprocess(images))
 
 
 def encode_with_image_markers(tokenizer, text: str, image_token_id: int = IMAGE_TOKEN_ID) -> list[int]:

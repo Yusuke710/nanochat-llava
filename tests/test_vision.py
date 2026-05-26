@@ -37,13 +37,16 @@ from scripts.vlm_eval import (
     parse_inline_options,
 )
 from scripts.vlm_train import (
-    batch_features_and_examples,
+    evaluate_vlm_loss,
     get_lr_multiplier,
     load_records,
     next_batch,
+    num_eval_batches,
     open_image,
+    open_images,
     render_records,
     save_training_checkpoint,
+    split_train_val_examples,
     supervised_target_count,
 )
 
@@ -295,15 +298,19 @@ def test_training_checkpoint_metadata_records_vision_config(tmp_path):
 
 def test_training_rendering_filters_bad_rows_and_counts_targets():
     tokenizer = TinyTokenizer()
-    records = [{"image": "tiny.jpg", "blip_caption": "caption"}]
-    rendered = render_records(records, tokenizer, stage=1, max_seq_len=256)
+    records = [{"image": "tiny.jpg", "messages": [{"role": "user", "content": "Describe."}, {"role": "assistant", "content": "caption"}]}]
+    rendered = render_records(records, tokenizer, max_seq_len=256)
     assert len(rendered) == 1
     assert supervised_target_count(rendered[0]["tokens"], rendered[0]["mask"]) > 0
 
     direct_image_answer_tokens = [1, IMAGE_TOKEN_ID, 65]
     assert supervised_target_count(direct_image_answer_tokens, [0, 0, 1]) == 0
     with pytest.raises(AssertionError, match="no usable"):
-        render_records([{"image": "tiny.jpg", "caption": "x" * 300}], tokenizer, stage=1, max_seq_len=128)
+        render_records(
+            [{"image": "tiny.jpg", "messages": [{"role": "user", "content": "Describe."}, {"role": "assistant", "content": "x" * 300}]}],
+            tokenizer,
+            max_seq_len=128,
+        )
 
 
 def test_next_batch_respects_padded_token_budget():
@@ -315,6 +322,48 @@ def test_next_batch_respects_padded_token_budget():
     batch, cursor = next_batch(examples, batch_size=3, cursor=0, rng=__import__("random").Random(0), max_batch_tokens=180)
     assert len(batch) <= 2
     assert cursor > 0
+
+
+def test_split_train_val_examples_is_small_and_optional():
+    examples = [{"i": i} for i in range(20)]
+    train, val = split_train_val_examples(examples, val_examples=8, use_val=True)
+    assert len(train) == 18
+    assert len(val) == 2
+    assert val == examples[-2:]
+
+    train, val = split_train_val_examples(examples, val_examples=8, use_val=False)
+    assert train == examples
+    assert val == []
+
+
+def test_num_eval_batches_uses_token_budget():
+    assert num_eval_batches(eval_tokens=0, max_batch_tokens=100, batch_size=2, max_seq_len=50) == 0
+    assert num_eval_batches(eval_tokens=250, max_batch_tokens=100, batch_size=2, max_seq_len=50) == 3
+    assert num_eval_batches(eval_tokens=250, max_batch_tokens=0, batch_size=2, max_seq_len=50) == 3
+
+
+def test_evaluate_vlm_loss_restores_train_mode():
+    model, projector = tiny_model()
+    model.train()
+    projector.train()
+
+    class Extractor:
+        def encode_pixel_values(self, pixel_values):
+            return torch.randn(pixel_values.size(0), VISION_TOKENS, 8)
+
+    packed = {
+        "rows": [[1, IMAGE_TOKEN_ID, 10, 11]],
+        "masks": [[0, 0, 1, 1]],
+        "pixel_values": torch.randn(1, 3, 4, 4),
+        "image_counts": [1],
+        "segment_lengths": [[4]],
+        "num_examples": 1,
+    }
+    stats = evaluate_vlm_loss(model, projector, Extractor(), [packed], eval_tokens=1000)
+    assert stats["target_tokens"] > 0
+    assert stats["loss"] > 0
+    assert model.training
+    assert projector.training
 
 
 def test_load_records_streams_hf_json(monkeypatch):
@@ -349,7 +398,7 @@ def test_load_records_and_render_finevision_schema(monkeypatch):
     monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
     args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file=None, hf_config="cfg", max_examples=1, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
     records, source = load_records(args)
-    rendered = render_records(records, TinyTokenizer(), stage=2, max_seq_len=256)
+    rendered = render_records(records, TinyTokenizer(), max_seq_len=256)
     assert source == "stream:repo/cfg first 1 rows"
     assert len(rendered) == 1
     assert count_image_tokens(rendered[0]["tokens"]) == 1
@@ -376,17 +425,14 @@ def test_image_zip_and_finevision_loading(tmp_path):
     assert from_bytes.size == (2, 2)
 
 
-def test_batch_features_can_skip_dead_images(tmp_path):
+def test_open_images_can_skip_dead_images(tmp_path):
     Image.new("RGB", (4, 4), color=(1, 2, 3)).save(tmp_path / "ok.jpg")
     examples = [{"record": {"image": "ok.jpg"}}, {"record": {"image": "missing.jpg"}}]
 
-    class Extractor:
-        def __call__(self, images):
-            return torch.stack([torch.full((VISION_TOKENS, 2), float(sum(image.getpixel((0, 0))))) for image in images])
-
-    feats, kept = batch_features_and_examples(Extractor(), examples, tmp_path, skip_bad_images=True)
+    images, kept = open_images(examples, tmp_path, skip_bad_images=True)
     assert len(kept) == 1
-    assert feats.shape == (1, VISION_TOKENS, 2)
+    assert len(images) == 1
+    assert images[0].size == (4, 4)
 
 
 def test_eval_prompt_matching_and_samples():
@@ -444,9 +490,12 @@ def test_lr_schedule_and_modal_command_builders():
     assert train_cmd[train_cmd.index("--hf-config") + 1] == "vqav2"
     assert "--require-fa3-varlen" in train_cmd
     assert "--no-save" in train_cmd
+    assert "--eval-tokens" in train_cmd
+    assert "--eval-steps" not in train_cmd
     assert "--profile-timing" not in train_cmd
     assert "--fp8" not in train_cmd
 
     eval_cmd = modal_vlm.build_eval_cmd(limit=3, max_scan=9, benchmarks="mmstar,chartqa")
     assert eval_cmd[:3] == ["python", "-m", "scripts.vlm_eval"]
     assert eval_cmd[eval_cmd.index("--benchmarks") + 1] == "mmstar,chartqa"
+    assert "--control" not in eval_cmd

@@ -31,6 +31,8 @@ Abuse Prevention:
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import torch
@@ -46,7 +48,15 @@ from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from nanochat.engine import Engine, sample_next_token
+from nanochat.vision import (
+    IMAGE_MARKER,
+    SIGLIP_MODEL_ID,
+    SigLIPPooledFeatureExtractor,
+    build_multimodal_batch,
+    encode_with_image_markers,
+    load_vlm_checkpoint,
+)
 
 # Abuse prevention limits
 MAX_MESSAGES_PER_REQUEST = 500
@@ -58,6 +68,8 @@ MIN_TOP_K = 0 # 0 disables top-k filtering, using full vocabulary
 MAX_TOP_K = 200
 MIN_MAX_TOKENS = 1
 MAX_MAX_TOKENS = 4096
+MAX_IMAGES_PER_REQUEST = 4
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 parser = argparse.ArgumentParser(description='NanoChat Web Server')
 parser.add_argument('-n', '--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
@@ -70,6 +82,10 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--vlm-checkpoint-dir', default=None, help='Optional VLM checkpoint directory; enables image chat')
+parser.add_argument('--vlm-checkpoint-step', type=int, default=None, help='VLM checkpoint step')
+parser.add_argument('--siglip-model-id', default=SIGLIP_MODEL_ID, help='SigLIP model used by the VLM checkpoint')
+parser.add_argument('--siglip-cache-dir', default=None, help='Optional SigLIP cache directory')
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -88,8 +104,11 @@ class Worker:
     """A worker with a model loaded on a specific GPU."""
     gpu_id: int
     device: torch.device
+    model: object
     engine: Engine
     tokenizer: object
+    projector: object = None
+    extractor: object = None
 
 class WorkerPool:
     """Pool of workers, each with a model replica on a different GPU."""
@@ -109,6 +128,8 @@ class WorkerPool:
         print(f"Initializing worker pool with {self.num_gpus} GPUs...")
         if self.num_gpus > 1:
             assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
+        if args.vlm_checkpoint_dir is not None:
+            assert args.vlm_checkpoint_step is not None, "--vlm-checkpoint-step is required with --vlm-checkpoint-dir"
 
         for gpu_id in range(self.num_gpus):
 
@@ -120,12 +141,30 @@ class WorkerPool:
                 print(f"Loading model on {device_type}...")
 
             model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            projector = None
+            extractor = None
+            if args.vlm_checkpoint_dir is not None:
+                print(f"Loading VLM checkpoint on {device}: {args.vlm_checkpoint_dir}@{args.vlm_checkpoint_step}")
+                model_state, projector, _, _ = load_vlm_checkpoint(args.vlm_checkpoint_dir, args.vlm_checkpoint_step, device, load_optimizer=False)
+                model.load_state_dict(model_state, strict=True, assign=True)
+                projector.eval()
+                siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
+                extractor = SigLIPPooledFeatureExtractor(
+                    args.siglip_model_id,
+                    device=device,
+                    cache_dir=siglip_cache_dir,
+                    verbose=gpu_id == 0,
+                )
+            model.eval()
             engine = Engine(model, tokenizer)
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,
+                model=model,
                 engine=engine,
                 tokenizer=tokenizer,
+                projector=projector,
+                extractor=extractor,
             )
             self.workers.append(worker)
             await self.available_workers.put(worker)
@@ -143,6 +182,7 @@ class WorkerPool:
 class ChatMessage(BaseModel):
     role: str
     content: str
+    image: Optional[str] = None
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
@@ -163,8 +203,9 @@ def validate_chat_request(request: ChatRequest):
 
     # Check individual message lengths and total conversation length
     total_length = 0
+    image_count = 0
     for i, message in enumerate(request.messages):
-        if not message.content:
+        if not message.content and not message.image:
             raise HTTPException(status_code=400, detail=f"Message {i} has empty content")
 
         msg_length = len(message.content)
@@ -174,12 +215,20 @@ def validate_chat_request(request: ChatRequest):
                 detail=f"Message {i} is too long. Maximum {MAX_MESSAGE_LENGTH} characters allowed per message"
             )
         total_length += msg_length
+        if message.image:
+            if message.role != "user":
+                raise HTTPException(status_code=400, detail=f"Message {i} has an image but is not a user message")
+            image_count += 1
+            if len(message.image) > MAX_IMAGE_BYTES * 2:
+                raise HTTPException(status_code=400, detail=f"Message {i} image is too large")
 
     if total_length > MAX_TOTAL_CONVERSATION_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Total conversation is too long. Maximum {MAX_TOTAL_CONVERSATION_LENGTH} characters allowed"
         )
+    if image_count > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(status_code=400, detail=f"Too many images. Maximum {MAX_IMAGES_PER_REQUEST} images allowed")
 
     # Validate role values
     for i, message in enumerate(request.messages):
@@ -212,6 +261,27 @@ def validate_chat_request(request: ChatRequest):
                 status_code=400,
                 detail=f"max_tokens must be between {MIN_MAX_TOKENS} and {MAX_MAX_TOKENS}"
             )
+
+def decode_image_data(image_data: str):
+    """Decode a browser data URL into a RGB PIL image."""
+    if image_data.startswith("data:"):
+        try:
+            _, image_data = image_data.split(",", 1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid image encoding")
+    try:
+        raw = base64.b64decode(image_data, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image encoding")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large")
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        return image.convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -302,6 +372,59 @@ async def generate_stream(
 
     yield f"data: {json.dumps({'done': True})}\n\n"
 
+async def generate_vision_stream(
+    worker: Worker,
+    tokens,
+    images,
+    temperature=None,
+    max_new_tokens=None,
+    top_k=None
+) -> AsyncGenerator[str, None]:
+    """Simple no-KV-cache VLM streaming path."""
+    temperature = temperature if temperature is not None else args.temperature
+    max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
+    top_k = top_k if top_k is not None else args.top_k
+
+    assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
+    bos = worker.tokenizer.get_bos_token_id()
+    rng = torch.Generator(device=worker.device)
+    rng.manual_seed(random.randint(0, 2**31 - 1))
+
+    image_features = worker.extractor(images)
+    tokens = list(tokens)
+    accumulated_tokens = []
+    last_clean_text = ""
+
+    for _ in range(max_new_tokens):
+        row = tokens + [tokens[-1]]
+        mask = [0] * len(row)
+        batch = build_multimodal_batch(
+            worker.model,
+            worker.projector,
+            [row],
+            image_features,
+            loss_mask_rows=[mask],
+            image_counts_per_row=[len(images)],
+            value_fallback_token_id=bos,
+        )
+        logits = worker.model(batch.value_token_ids, input_embeds=batch.input_embeds)
+        logits = logits[:, batch.lengths[0].item() - 1, :]
+        token = int(sample_next_token(logits, rng, temperature=temperature, top_k=top_k).item())
+        if token == assistant_end or token == bos:
+            break
+
+        tokens.append(token)
+        accumulated_tokens.append(token)
+        current_text = worker.tokenizer.decode(accumulated_tokens)
+        if not current_text.endswith('�'):
+            new_text = current_text[len(last_clean_text):]
+            if new_text:
+                yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
+                last_clean_text = current_text
+        await asyncio.sleep(0)
+
+    yield f"data: {json.dumps({'done': True})}\n\n"
+
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest):
     """Chat completion endpoint (streaming only) - uses worker pool for multi-GPU."""
@@ -312,7 +435,8 @@ async def chat_completions(request: ChatRequest):
     # Log incoming conversation to console
     logger.info("="*20)
     for i, message in enumerate(request.messages):
-        logger.info(f"[{message.role.upper()}]: {message.content}")
+        image_suffix = " [image]" if message.image else ""
+        logger.info(f"[{message.role.upper()}]{image_suffix}: {message.content}")
     logger.info("-"*20)
 
     # Acquire a worker from the pool (will wait if all are busy)
@@ -328,10 +452,19 @@ async def chat_completions(request: ChatRequest):
         assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
 
         conversation_tokens = [bos]
+        images = []
         for message in request.messages:
             if message.role == "user":
                 conversation_tokens.append(user_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                if message.image:
+                    if worker.projector is None or worker.extractor is None:
+                        raise HTTPException(status_code=400, detail="Server was not started with --vlm-checkpoint-dir")
+                    images.append(decode_image_data(message.image))
+                    content = message.content.replace(IMAGE_MARKER, "").strip()
+                    content = content or "Describe the image."
+                    conversation_tokens.extend(encode_with_image_markers(worker.tokenizer, f"{IMAGE_MARKER}\n{content}"))
+                else:
+                    conversation_tokens.extend(worker.tokenizer.encode(message.content))
                 conversation_tokens.append(user_end)
             elif message.role == "assistant":
                 conversation_tokens.append(assistant_start)
@@ -344,12 +477,15 @@ async def chat_completions(request: ChatRequest):
         response_tokens = []
         async def stream_and_release():
             try:
-                async for chunk in generate_stream(
+                generator = generate_vision_stream if images else generate_stream
+                kwargs = {"images": images} if images else {}
+                async for chunk in generator(
                     worker,
                     conversation_tokens,
                     temperature=request.temperature,
                     max_new_tokens=request.max_tokens,
-                    top_k=request.top_k
+                    top_k=request.top_k,
+                    **kwargs,
                 ):
                     # Accumulate response for logging
                     chunk_data = json.loads(chunk.replace("data: ", "").strip())
@@ -380,6 +516,7 @@ async def health():
     return {
         "status": "ok",
         "ready": worker_pool is not None and len(worker_pool.workers) > 0,
+        "vlm": args.vlm_checkpoint_dir is not None,
         "num_gpus": worker_pool.num_gpus if worker_pool else 0,
         "available_workers": worker_pool.available_workers.qsize() if worker_pool else 0
     }
@@ -395,7 +532,8 @@ async def stats():
         "workers": [
             {
                 "gpu_id": w.gpu_id,
-                "device": str(w.device)
+                "device": str(w.device),
+                "vlm": w.projector is not None,
             } for w in worker_pool.workers
         ]
     }
@@ -404,4 +542,6 @@ if __name__ == "__main__":
     import uvicorn
     print(f"Starting NanoChat Web Server")
     print(f"Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
+    if args.vlm_checkpoint_dir is not None:
+        print(f"VLM image chat: {args.vlm_checkpoint_dir}@{args.vlm_checkpoint_step}")
     uvicorn.run(app, host=args.host, port=args.port)

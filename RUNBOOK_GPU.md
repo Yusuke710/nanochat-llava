@@ -37,6 +37,7 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --device-batch-size 128 \
   --max-batch-tokens 12000 \
   --model-step 650 \
+  --eval-tokens 524288 \
   --save-every 1000 \
   --require-fa3-varlen
 ```
@@ -65,7 +66,22 @@ uv run --extra vision --extra gpu python -m scripts.vlm_eval \
   --checkpoint-step 1000 \
   --out "$DATA_ROOT/checkpoints/vlm_eval.json" \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
-  --limit 16 \
-  --max-scan 240 \
-  --control
+  --limit 24 \
+  --max-scan 240
 ```
+
+## Web Chat
+
+```bash
+uv run --extra vision --extra gpu python -m scripts.chat_web \
+  --source sft \
+  --model-tag d32 \
+  --step 650 \
+  --device-type cuda \
+  --vlm-checkpoint-dir "$DATA_ROOT/checkpoints/vlm" \
+  --vlm-checkpoint-step 1000
+```
+
+Then open the printed local URL. The image button sends one browser-loaded image
+with the chat request; without the VLM flags, text chat continues to work as
+before.

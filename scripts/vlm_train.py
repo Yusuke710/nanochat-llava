@@ -10,7 +10,6 @@ attend across boundaries.
 import argparse
 import io
 import json
-import math
 import os
 import random
 import time
@@ -19,6 +18,7 @@ from pathlib import Path
 
 import torch
 import wandb
+from torch.utils.data import DataLoader, Dataset
 
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import DummyWandb, autodetect_device_type, compute_cleanup, compute_init, get_base_dir, get_peak_flops, print0
@@ -35,7 +35,6 @@ from nanochat.vision import (
     count_image_tokens,
     ensure_hf_nanochat_checkpoint,
     load_vlm_checkpoint,
-    render_caption_example,
     render_vision_conversation,
     save_vlm_checkpoint,
 )
@@ -49,15 +48,8 @@ UNTRUNCATED_MAX_TOKENS = 1_000_000_000
 INIT_LR_FRAC = 0.05
 WARMDOWN_RATIO = 0.5
 _ZIP_CACHE = {}
-
-
-def _first_assistant_text(example):
-    conv = example.get("conversations") or example.get("messages") or []
-    for msg in conv:
-        role = msg.get("from", msg.get("role"))
-        if role in {"gpt", "assistant"}:
-            return msg.get("value", msg.get("content", ""))
-    return example.get("caption", example.get("answer", ""))
+DEFAULT_EVAL_TOKENS = 524_288
+DEFAULT_VAL_EXAMPLES = 2048
 
 
 def _ensure_image_marker_in_conversation(example):
@@ -129,7 +121,8 @@ def _iter_hf_json_records(hf_repo: str, hf_file: str):
 def _record_limit(args):
     if args.max_examples > 0:
         return args.max_examples
-    return max(args.device_batch_size * args.grad_accum_steps * (args.num_iterations + 1) * 2, args.device_batch_size * 64)
+    train_needed = args.device_batch_size * args.grad_accum_steps * (args.num_iterations + 1) * 2
+    return max(train_needed + args.val_examples, args.device_batch_size * 64)
 
 
 def load_records(args):
@@ -232,16 +225,12 @@ def supervised_target_count(tokens, mask, image_token_id=IMAGE_TOKEN_ID):
     return count
 
 
-def render_records(records, tokenizer, max_seq_len=2048, stage=None):
+def render_records(records, tokenizer, max_seq_len=2048):
     rendered = []
     for rec in records:
         if _image_value(rec) is None:
             continue
-        if stage == 1:
-            caption = rec.get("caption") or rec.get("blip_caption") or _first_assistant_text(rec)
-            tokens, mask = render_caption_example(tokenizer, caption, max_tokens=UNTRUNCATED_MAX_TOKENS)
-        else:
-            tokens, mask = render_vision_conversation(tokenizer, _ensure_image_marker_in_conversation(rec), max_tokens=UNTRUNCATED_MAX_TOKENS)
+        tokens, mask = render_vision_conversation(tokenizer, _ensure_image_marker_in_conversation(rec), max_tokens=UNTRUNCATED_MAX_TOKENS)
         if count_image_tokens(tokens) != 1 or count_image_tokens(tokens[:-1]) != 1:
             continue
         if expanded_input_len(tokens) > max_seq_len:
@@ -250,6 +239,13 @@ def render_records(records, tokenizer, max_seq_len=2048, stage=None):
             rendered.append({"tokens": tokens, "mask": mask, "record": rec, "expanded_len": expanded_input_len(tokens)})
     assert rendered, "no usable image-text examples loaded"
     return rendered
+
+
+def split_train_val_examples(examples, val_examples=DEFAULT_VAL_EXAMPLES, use_val=True):
+    if not use_val or val_examples <= 0 or len(examples) < 2:
+        return examples, []
+    val_count = min(val_examples, max(1, len(examples) // 10), len(examples) - 1)
+    return examples[:-val_count], examples[-val_count:]
 
 
 def next_batch(examples, batch_size, cursor, rng, max_batch_tokens=0):
@@ -276,7 +272,7 @@ def next_batch(examples, batch_size, cursor, rng, max_batch_tokens=0):
     return batch, cursor
 
 
-def batch_features_and_examples(extractor, examples, image_root=None, image_zip=None, skip_bad_images=False):
+def open_images(examples, image_root=None, image_zip=None, skip_bad_images=False):
     images = []
     kept = []
     for i, example in enumerate(examples):
@@ -287,9 +283,7 @@ def batch_features_and_examples(extractor, examples, image_root=None, image_zip=
             if not skip_bad_images:
                 raise
             print0(f"skipping image {example['record'].get('id', i)}: {type(exc).__name__}: {exc}")
-    if not images:
-        return None, kept
-    return extractor(images), kept
+    return images, kept
 
 
 def pack_examples(examples, image_features):
@@ -301,6 +295,168 @@ def pack_examples(examples, image_features):
         mask.extend(example["mask"])
         segment_lengths.append(len(example["tokens"]))
     return [row], [mask], image_features[:len(examples)], [len(examples)], [segment_lengths]
+
+
+class PackedVisionBatchDataset(Dataset):
+    """Prepared VLM microbatches with image decode/CPU processing in DataLoader workers."""
+
+    def __init__(
+        self,
+        batches,
+        siglip_model_id,
+        siglip_cache_dir=None,
+        image_root=None,
+        image_zip=None,
+        skip_bad_images=True,
+    ):
+        self.batches = batches
+        self.siglip_model_id = siglip_model_id
+        self.siglip_cache_dir = siglip_cache_dir
+        self.image_root = image_root
+        self.image_zip = image_zip
+        self.skip_bad_images = skip_bad_images
+        self.processor = None
+
+    def __len__(self):
+        return len(self.batches)
+
+    def _processor(self):
+        if self.processor is None:
+            from transformers import AutoImageProcessor
+
+            kwargs = {"cache_dir": self.siglip_cache_dir} if self.siglip_cache_dir else {}
+            self.processor = AutoImageProcessor.from_pretrained(self.siglip_model_id, **kwargs)
+        return self.processor
+
+    def __getitem__(self, idx):
+        examples = self.batches[idx]
+        images, kept = open_images(examples, self.image_root, self.image_zip, self.skip_bad_images)
+        if not images:
+            return None
+        pixel_values = self._processor()(images=images, return_tensors="pt")["pixel_values"]
+        rows, masks, pixel_values, image_counts, segment_lengths = pack_examples(kept, pixel_values)
+        return {
+            "rows": rows,
+            "masks": masks,
+            "pixel_values": pixel_values,
+            "image_counts": image_counts,
+            "segment_lengths": segment_lengths,
+            "num_examples": len(kept),
+        }
+
+
+def build_training_batches(examples, num_batches, batch_size, max_batch_tokens, seed):
+    examples = list(examples)
+    rng = random.Random(seed)
+    cursor = 0
+    batches = []
+    for _ in range(num_batches):
+        batch, cursor = next_batch(examples, batch_size, cursor, rng, max_batch_tokens=max_batch_tokens)
+        if not batch:
+            raise RuntimeError("could not build a non-empty VLM microbatch")
+        batches.append(batch)
+    return batches
+
+
+def num_eval_batches(eval_tokens, max_batch_tokens, batch_size, max_seq_len):
+    if eval_tokens <= 0:
+        return 0
+    tokens_per_batch = max_batch_tokens if max_batch_tokens > 0 else batch_size * max_seq_len
+    return max(1, (eval_tokens + tokens_per_batch - 1) // tokens_per_batch)
+
+
+def build_batch_loader(args, examples, siglip_cache_dir, device_type, num_batches, seed):
+    batches = build_training_batches(
+        examples,
+        num_batches=num_batches,
+        batch_size=args.device_batch_size,
+        max_batch_tokens=args.max_batch_tokens,
+        seed=seed,
+    )
+    workers = max(0, args.num_workers)
+    kwargs = {
+        "batch_size": None,
+        "num_workers": workers,
+        "pin_memory": device_type == "cuda",
+    }
+    if workers > 0:
+        kwargs.update({
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+        })
+        if device_type == "cuda":
+            kwargs["multiprocessing_context"] = "spawn"
+    dataset = PackedVisionBatchDataset(
+        batches,
+        args.siglip_model_id,
+        siglip_cache_dir=siglip_cache_dir,
+        image_root=args.image_root,
+        image_zip=args.image_zip,
+        skip_bad_images=args.skip_bad_images,
+    )
+    return DataLoader(dataset, **kwargs)
+
+
+def compute_vlm_loss(model, projector, extractor, packed):
+    feats = extractor.encode_pixel_values(packed["pixel_values"])
+    rows = packed["rows"]
+    batch = build_multimodal_batch(
+        model,
+        projector,
+        rows,
+        feats,
+        loss_mask_rows=packed["masks"],
+        image_counts_per_row=packed["image_counts"],
+        segment_token_lengths_per_row=packed["segment_lengths"],
+        max_seq_len=None,
+        value_fallback_token_id=rows[0][0],
+    )
+    loss = model(
+        batch.value_token_ids,
+        batch.targets,
+        input_embeds=batch.input_embeds,
+        position_ids=batch.position_ids,
+        segment_starts=batch.segment_starts,
+        cu_seqlens=batch.cu_seqlens,
+        max_seqlen=batch.max_seqlen,
+        loss_indices=batch.loss_indices,
+        loss_targets=batch.loss_targets,
+    )
+    return loss, int(batch.token_count or batch.lengths.sum()), int(batch.loss_targets.numel()), int(packed["num_examples"])
+
+
+@torch.no_grad()
+def evaluate_vlm_loss(model, projector, extractor, loader, eval_tokens):
+    model_was_training = model.training
+    projector_was_training = projector.training
+    model.eval()
+    projector.eval()
+    total_loss = 0.0
+    total_targets = 0
+    total_tokens = 0
+    total_samples = 0
+    for packed in loader:
+        if total_tokens >= eval_tokens:
+            break
+        if packed is None or int(packed["num_examples"]) == 0:
+            continue
+        loss, token_count, target_count, sample_count = compute_vlm_loss(model, projector, extractor, packed)
+        total_loss += float(loss) * target_count
+        total_targets += target_count
+        total_tokens += token_count
+        total_samples += sample_count
+    if model_was_training:
+        model.train()
+    if projector_was_training:
+        projector.train()
+    if total_targets == 0:
+        return None
+    return {
+        "loss": total_loss / total_targets,
+        "target_tokens": total_targets,
+        "tokens": total_tokens,
+        "samples": total_samples,
+    }
 
 
 def count_params(parameters):
@@ -391,12 +547,16 @@ def main():
     parser.add_argument("--device-batch-size", type=int, default=128)
     parser.add_argument("--max-batch-tokens", type=int, default=12000)
     parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-iterations", type=int, default=1000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--projector-lr", type=float, default=2e-3)
     parser.add_argument("--save-every", type=int, default=-1)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--eval-every", type=int, default=200)
+    parser.add_argument("--eval-tokens", type=int, default=DEFAULT_EVAL_TOKENS)
+    parser.add_argument("--val-examples", type=int, default=DEFAULT_VAL_EXAMPLES)
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--init-vlm-checkpoint-dir", default=None)
     parser.add_argument("--init-vlm-checkpoint-step", type=int, default=None)
@@ -427,7 +587,15 @@ def main():
     t = time.perf_counter()
     records, data_path = load_records(args)
     examples = render_records(records, tokenizer, max_seq_len=args.max_seq_len)
-    print0(f"Loaded {len(records):,} records and rendered {len(examples):,} examples in {time.perf_counter() - t:.2f}s")
+    train_examples, val_examples = split_train_val_examples(
+        examples,
+        val_examples=args.val_examples,
+        use_val=args.eval_every > 0 and args.eval_tokens > 0,
+    )
+    print0(
+        f"Loaded {len(records):,} records and rendered {len(train_examples):,} train / "
+        f"{len(val_examples):,} val examples in {time.perf_counter() - t:.2f}s"
+    )
 
     siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
     extractor = SigLIPPooledFeatureExtractor(args.siglip_model_id, device=device, cache_dir=siglip_cache_dir, verbose=ddp_rank == 0)
@@ -446,9 +614,32 @@ def main():
     projector.train()
     llm_optimizer = setup_llm_optimizer(model, args)
     projector_optimizer = torch.optim.AdamW(projector.parameters(), lr=args.projector_lr, weight_decay=0.0)
+    batch_loader = build_batch_loader(
+        args,
+        train_examples,
+        siglip_cache_dir,
+        device_type,
+        num_batches=args.num_iterations * args.grad_accum_steps,
+        seed=args.seed,
+    )
+    batch_iter = iter(batch_loader)
+    val_loader = None
+    if val_examples:
+        eval_batches = num_eval_batches(
+            args.eval_tokens,
+            args.max_batch_tokens,
+            args.device_batch_size,
+            args.max_seq_len,
+        )
+        val_loader = build_batch_loader(
+            args,
+            val_examples,
+            siglip_cache_dir,
+            device_type,
+            num_batches=eval_batches,
+            seed=args.seed + 1,
+        )
 
-    rng = random.Random(args.seed)
-    cursor = 0
     smooth_loss = 0.0
     smooth_count = 0
     t_start = time.time()
@@ -459,7 +650,7 @@ def main():
     trunk_flops_per_token = max(0.0, flops_per_token - lm_head_flops_per_token)
     total_params = count_params(model.parameters()) + count_params(projector.parameters())
     total_trainable = count_params(p for p in list(model.parameters()) + list(projector.parameters()) if p.requires_grad)
-    print0(f"VLM | GPU: {gpu_name} | examples: {len(examples):,} | data: {data_path} | out: {out_dir}")
+    print0(f"VLM | GPU: {gpu_name} | train: {len(train_examples):,} | val: {len(val_examples):,} | data: {data_path} | out: {out_dir}")
     print0(f"Params total/trainable: {total_params:,}/{total_trainable:,}")
     print0(f"FLOPs/token: {flops_per_token:e} | Peak BF16 FLOPS: {gpu_peak_flops:.2e}")
     if device_type == "cuda":
@@ -477,45 +668,16 @@ def main():
         target_tokens_this_step = 0
         samples_this_step = 0
         for _ in range(args.grad_accum_steps):
-            batch_examples, cursor = next_batch(examples, args.device_batch_size, cursor, rng, max_batch_tokens=args.max_batch_tokens)
-            feats, batch_examples = batch_features_and_examples(
-                extractor,
-                batch_examples,
-                image_root=args.image_root,
-                image_zip=args.image_zip,
-                skip_bad_images=args.skip_bad_images,
-            )
-            if feats is None or not batch_examples:
+            packed = next(batch_iter)
+            if packed is None or int(packed["num_examples"]) == 0:
                 continue
-            feats = feats.to(device=device, non_blocking=True)
-            rows, masks, feats, image_counts, segment_lengths = pack_examples(batch_examples, feats)
-            batch = build_multimodal_batch(
-                model,
-                projector,
-                rows,
-                feats,
-                loss_mask_rows=masks,
-                image_counts_per_row=image_counts,
-                segment_token_lengths_per_row=segment_lengths,
-                max_seq_len=None,
-                value_fallback_token_id=rows[0][0],
-            )
-            loss = model(
-                batch.value_token_ids,
-                batch.targets,
-                input_embeds=batch.input_embeds,
-                position_ids=batch.position_ids,
-                segment_starts=batch.segment_starts,
-                cu_seqlens=batch.cu_seqlens,
-                max_seqlen=batch.max_seqlen,
-                loss_indices=batch.loss_indices,
-                loss_targets=batch.loss_targets,
-            ) / args.grad_accum_steps
+            loss, token_count, target_count, sample_count = compute_vlm_loss(model, projector, extractor, packed)
+            loss = loss / args.grad_accum_steps
             loss.backward()
             train_loss = loss.detach() * args.grad_accum_steps
-            tokens_this_step += int(batch.token_count or batch.lengths.sum())
-            target_tokens_this_step += int(batch.loss_targets.numel())
-            samples_this_step += len(batch_examples)
+            tokens_this_step += token_count
+            target_tokens_this_step += target_count
+            samples_this_step += sample_count
         if train_loss is None:
             raise RuntimeError("no usable images loaded for this optimizer step")
 
@@ -552,6 +714,21 @@ def main():
                 "train/mfu": mfu,
                 "train/lrm": lrm,
             })
+        if val_loader is not None and (step % args.eval_every == 0 or step == args.num_iterations):
+            val_stats = evaluate_vlm_loss(model, projector, extractor, val_loader, args.eval_tokens)
+            if val_stats is not None:
+                print0(
+                    f"step {step:05d}/{args.num_iterations:05d} | val_loss {val_stats['loss']:.6f} | "
+                    f"val_target_tokens {val_stats['target_tokens']:,}",
+                    flush=True,
+                )
+                wandb_run.log({
+                    "step": step,
+                    "val/loss": val_stats["loss"],
+                    "val/target_tokens": val_stats["target_tokens"],
+                    "val/tokens": val_stats["tokens"],
+                    "val/samples": val_stats["samples"],
+                })
         if not args.no_save and args.save_every > 0 and step % args.save_every == 0:
             save_training_checkpoint(out_dir, step, model, projector, args, meta, data_path, rank=ddp_rank)
 

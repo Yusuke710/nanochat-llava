@@ -359,7 +359,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run nanochat-llava verifier eval subsets")
     parser.add_argument("--benchmarks", default="mmstar,scienceqa,chartqa,mmmu,textvqa")
     parser.add_argument("--mmmu-configs", default="Accounting", help="comma-separated MMMU configs used when --benchmarks includes bare mmmu")
-    parser.add_argument("--limit", type=int, default=32)
+    parser.add_argument("--limit", type=int, default=24)
     parser.add_argument("--max-scan", type=int, default=0, help="max records to scan per benchmark; 0 means limit*20")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--checkpoint-step", type=int, required=True)

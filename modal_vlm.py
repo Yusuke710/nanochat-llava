@@ -67,6 +67,9 @@ def build_train_cmd(
     no_save: bool = False,
     require_fa3_varlen: bool = False,
     log_every: int = 10,
+    num_workers: int = 4,
+    eval_every: int = 200,
+    eval_tokens: int = 524288,
 ):
     cmd = [
         "python",
@@ -92,6 +95,12 @@ def build_train_cmd(
         str(model_step),
         "--log-every",
         str(log_every),
+        "--num-workers",
+        str(num_workers),
+        "--eval-every",
+        str(eval_every),
+        "--eval-tokens",
+        str(eval_tokens),
         "--skip-bad-images",
     ]
     if max_examples > 0:
@@ -110,7 +119,7 @@ def build_eval_cmd(
     checkpoint_step: int = 1000,
     out: str = "/vol/checkpoints/vlm_eval.json",
     benchmarks: str = "mmstar,scienceqa,chartqa,mmmu,textvqa",
-    limit: int = 16,
+    limit: int = 24,
     max_scan: int = 240,
 ):
     return [
@@ -129,7 +138,6 @@ def build_eval_cmd(
         str(limit),
         "--max-scan",
         str(max_scan),
-        "--control",
     ]
 
 
@@ -163,6 +171,9 @@ def train(
     no_save: bool = False,
     require_fa3_varlen: bool = True,
     log_every: int = 10,
+    num_workers: int = 4,
+    eval_every: int = 200,
+    eval_tokens: int = 524288,
 ):
     _run(build_train_cmd(
         out_dir=out_dir,
@@ -177,6 +188,9 @@ def train(
         no_save=no_save,
         require_fa3_varlen=require_fa3_varlen,
         log_every=log_every,
+        num_workers=num_workers,
+        eval_every=eval_every,
+        eval_tokens=eval_tokens,
     ))
 
 
@@ -186,7 +200,7 @@ def eval(
     checkpoint_step: int = 1000,
     out: str = "/vol/checkpoints/vlm_eval.json",
     benchmarks: str = "mmstar,scienceqa,chartqa,mmmu,textvqa",
-    limit: int = 16,
+    limit: int = 24,
     max_scan: int = 240,
 ):
     _run(build_eval_cmd(checkpoint_dir, checkpoint_step, out, benchmarks, limit, max_scan))

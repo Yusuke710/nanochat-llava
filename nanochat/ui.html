@@ -151,12 +151,36 @@
             padding-bottom: calc(1rem + env(safe-area-inset-bottom))
         }
 
-        .input-wrapper {
+        .composer-wrapper {
             max-width: 48rem;
             margin: 0 auto;
+        }
+
+        .input-wrapper {
             display: flex;
             gap: 0.75rem;
             align-items: flex-end;
+        }
+
+        .image-button {
+            flex-shrink: 0;
+            padding: 0;
+            width: 54px;
+            height: 54px;
+            border: 1px solid #d1d5db;
+            border-radius: 0.75rem;
+            background-color: #ffffff;
+            color: #374151;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background-color 0.2s ease, border-color 0.2s ease;
+        }
+
+        .image-button:hover {
+            background-color: #f3f4f6;
+            border-color: #9ca3af;
         }
 
         .chat-input {
@@ -236,6 +260,56 @@
             border-radius: 0.75rem;
             margin-top: 0.5rem;
         }
+
+        .image-preview {
+            position: relative;
+            width: 96px;
+            height: 96px;
+            margin-bottom: 0.75rem;
+        }
+
+        .image-preview[hidden] {
+            display: none;
+        }
+
+        .image-preview img,
+        .message-image {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 0.5rem;
+            border: 1px solid #e5e7eb;
+        }
+
+        .remove-image-button {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            width: 24px;
+            height: 24px;
+            padding: 0;
+            border: 1px solid #d1d5db;
+            border-radius: 999px;
+            background: #ffffff;
+            color: #111827;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .message.user .message-content {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .message.user .message-image {
+            width: min(260px, 100%);
+            height: auto;
+            max-height: 260px;
+            aspect-ratio: auto;
+        }
     </style>
 </head>
 <body>
@@ -258,20 +332,39 @@
     </div>
 
     <div class="input-container">
-        <div class="input-wrapper">
-            <textarea
-                id="chatInput"
-                class="chat-input"
-                placeholder="Ask anything"
-                rows="1"
-                onkeydown="handleKeyDown(event)"
-            ></textarea>
-            <button id="sendButton" class="send-button" onclick="sendMessage()" disabled>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M22 2L11 13"></path>
-                    <path d="M22 2l-7 20-4-9-9-4 20-7z"></path>
-                </svg>
-            </button>
+        <div class="composer-wrapper">
+            <div id="imagePreview" class="image-preview" hidden>
+                <img id="imagePreviewImg" alt="">
+                <button class="remove-image-button" onclick="clearSelectedImage()" title="Remove image">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                        <path d="M18 6L6 18"></path>
+                        <path d="M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+            <div class="input-wrapper">
+                <input id="imageInput" type="file" accept="image/*" hidden>
+                <button id="imageButton" class="image-button" onclick="document.getElementById('imageInput').click()" title="Attach image">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                        <path d="M21 15l-5-5L5 21"></path>
+                    </svg>
+                </button>
+                <textarea
+                    id="chatInput"
+                    class="chat-input"
+                    placeholder="Ask anything"
+                    rows="1"
+                    onkeydown="handleKeyDown(event)"
+                ></textarea>
+                <button id="sendButton" class="send-button" onclick="sendMessage()" disabled>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M22 2L11 13"></path>
+                        <path d="M22 2l-7 20-4-9-9-4 20-7z"></path>
+                    </svg>
+                </button>
+            </div>
         </div>
     </div>
 
@@ -281,17 +374,43 @@
         const chatWrapper = document.getElementById('chatWrapper');
         const chatInput = document.getElementById('chatInput');
         const sendButton = document.getElementById('sendButton');
+        const imageInput = document.getElementById('imageInput');
+        const imagePreview = document.getElementById('imagePreview');
+        const imagePreviewImg = document.getElementById('imagePreviewImg');
 
         let messages = [];
         let isGenerating = false;
         let currentTemperature = 0.8;
         let currentTopK = 50;
+        let selectedImage = null;
 
         chatInput.addEventListener('input', function() {
             this.style.height = 'auto';
             this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-            sendButton.disabled = !this.value.trim() || isGenerating;
+            updateSendButton();
         });
+
+        imageInput.addEventListener('change', function() {
+            const file = this.files && this.files[0];
+            if (!file) return;
+            if (file.size > 8 * 1024 * 1024) {
+                addMessage('console', 'Image is too large');
+                this.value = '';
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = function() {
+                selectedImage = reader.result;
+                imagePreviewImg.src = selectedImage;
+                imagePreview.hidden = false;
+                updateSendButton();
+            };
+            reader.readAsDataURL(file);
+        });
+
+        function updateSendButton() {
+            sendButton.disabled = isGenerating || (!chatInput.value.trim() && !selectedImage);
+        }
 
         function handleKeyDown(event) {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -315,18 +434,38 @@
             chatWrapper.innerHTML = '';
             chatInput.value = '';
             chatInput.style.height = 'auto';
-            sendButton.disabled = false;
+            clearSelectedImage();
             isGenerating = false;
+            updateSendButton();
             chatInput.focus();
         }
 
-        function addMessage(role, content, messageIndex = null) {
+        function clearSelectedImage() {
+            selectedImage = null;
+            imageInput.value = '';
+            imagePreviewImg.removeAttribute('src');
+            imagePreview.hidden = true;
+            updateSendButton();
+        }
+
+        function addMessage(role, content, messageIndex = null, image = null) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${role}`;
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
-            contentDiv.textContent = content;
+            if (image) {
+                const img = document.createElement('img');
+                img.className = 'message-image';
+                img.src = image;
+                img.alt = '';
+                contentDiv.appendChild(img);
+            }
+            if (content) {
+                const textDiv = document.createElement('div');
+                textDiv.textContent = content;
+                contentDiv.appendChild(textDiv);
+            }
 
             // Add click handler for user messages to enable editing
             if (role === 'user' && messageIndex !== null) {
@@ -368,6 +507,13 @@
             chatInput.value = messageToEdit.content;
             chatInput.style.height = 'auto';
             chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+            if (messageToEdit.image) {
+                selectedImage = messageToEdit.image;
+                imagePreviewImg.src = selectedImage;
+                imagePreview.hidden = false;
+            } else {
+                clearSelectedImage();
+            }
 
             // Remove this message and all subsequent messages from the array
             messages = messages.slice(0, messageIndex);
@@ -379,7 +525,7 @@
             }
 
             // Enable send button and focus input
-            sendButton.disabled = false;
+            updateSendButton();
             chatInput.focus();
         }
 
@@ -452,7 +598,7 @@
                 assistantContent.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
             } finally {
                 isGenerating = false;
-                sendButton.disabled = !chatInput.value.trim();
+                updateSendButton();
             }
         }
 
@@ -527,27 +673,30 @@
 
         async function sendMessage() {
             const message = chatInput.value.trim();
-            if (!message || isGenerating) return;
+            if ((!message && !selectedImage) || isGenerating) return;
 
             // Handle slash commands
-            if (message.startsWith('/')) {
+            if (message.startsWith('/') && !selectedImage) {
                 chatInput.value = '';
                 chatInput.style.height = 'auto';
                 handleSlashCommand(message);
+                updateSendButton();
                 return;
             }
 
+            const image = selectedImage;
             chatInput.value = '';
             chatInput.style.height = 'auto';
+            clearSelectedImage();
 
             const userMessageIndex = messages.length;
-            messages.push({ role: 'user', content: message });
-            addMessage('user', message, userMessageIndex);
+            messages.push({ role: 'user', content: message, image: image });
+            addMessage('user', message, userMessageIndex, image);
 
             await generateAssistantResponse();
         }
 
-        sendButton.disabled = false;
+        updateSendButton();
 
         // Autofocus the chat input on page load
         chatInput.focus();

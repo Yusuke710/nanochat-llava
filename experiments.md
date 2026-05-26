@@ -21,6 +21,7 @@ were intentionally removed to keep the implementation minimal.
 - Keep inline SigLIP for v0 so the main path reflects real training.
 - Do not judge success from aggregate benchmark numbers alone. Compare separate checkpoint eval JSONs and inspect stored sample generations.
 - The old Stage 1/Stage 2 split lives only in the experiment branch. Main uses one visual-instruction path.
+- Follow nanochat's eval shape: training-time loss eval is token-budgeted, not example-counted. Main uses `--eval-tokens 524288` over a held-out VLM pool. Standalone VLM benchmark eval is separate and defaults to 24 examples per benchmark, matching nanochat's small generative ChatCORE cap.
 
 ## Current commands
 
@@ -51,7 +52,7 @@ uv run --extra vision modal run modal_vlm.py::eval \
   --checkpoint-step 1000 \
   --out /vol/checkpoints/vlm_eval.json \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
-  --limit 16 \
+  --limit 24 \
   --max-scan 240
 ```
 
@@ -211,8 +212,9 @@ step 00060/00100 | loss 1.513127 | samples/sec 0.87 | tokens/sec 404 | bf16_mfu 
 ```
 
 The old `image+siglip` bucket included image download/open/decode, CPU processor
-work, host-to-device transfer, SigLIP forward, and feature pooling. The trainer
-now splits this bucket when `--profile-timing` is enabled.
+work, host-to-device transfer, SigLIP forward, and feature pooling. That
+profiling flag belonged to the experiment branch; main keeps only the clean
+training loop.
 
 Follow-up 3-step Modal profile with the split timer:
 
@@ -339,6 +341,27 @@ the experiment branch's efficient path:
   lookup for `value_token_ids`, one projector call for all visual features, and
   indexed insertion of the 64 visual embeddings.
 
+Data-pipeline reference from existing VLM repos:
+
+- nanoVLM keeps the path simple: dataset workers process PIL images with the
+  image processor, the DataLoader uses `num_workers` and `pin_memory`, and the
+  model forward concatenates image tensors and runs the vision encoder on the
+  model device. Relevant code:
+  [dataset image processing](https://github.com/huggingface/nanoVLM/blob/main/data/datasets.py#L62-L77),
+  [DataLoader workers/pin memory](https://github.com/huggingface/nanoVLM/blob/main/train.py#L213-L223),
+  [model-side image H2D/vision encoder](https://github.com/huggingface/nanoVLM/blob/main/models/vision_language_model.py#L51-L68).
+- InternVL uses the same split at larger scale: the dataset opens images with
+  TCS/PIL, applies CPU transforms, and returns stacked `pixel_values`; the
+  collator concatenates `pixel_values`; Trainer/Accelerate moves the batch to
+  the device; the model forward calls `extract_feature(pixel_values)`, which
+  runs the vision model and projector before inserting visual embeddings into
+  the LLM input embeddings. Relevant code:
+  [image open/CPU transform](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/train/internvl_chat_finetune.py#L401-L442),
+  [pixel_values collator](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/patch/pad_data_collator.py#L98-L116),
+  [DataLoader workers/pin memory](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/patch/train_dataloader_patch.py#L33-L48),
+  [model forward](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L143-L166),
+  [vision encoder/projector](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L273-L291).
+
 Modal H100 follow-up on the simplified main branch:
 
 ```text
@@ -349,6 +372,16 @@ step 00003/00006 | tokens/sec 7228 | bf16_mfu 8.30
 step 00004/00006 | tokens/sec 7733 | bf16_mfu 8.89
 step 00005/00006 | tokens/sec 7136 | bf16_mfu 8.20
 step 00006/00006 | tokens/sec 6956 | bf16_mfu 7.99
+Peak memory usage: 69524.90MiB
+
+target-only CE + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+max_batch_tokens=18000, max_examples=1024, steps=6, num_workers=4
+step 00001/00006 | tokens/sec 560 | bf16_mfu 0.64
+step 00002/00006 | tokens/sec 21475 | bf16_mfu 24.67
+step 00003/00006 | tokens/sec 20912 | bf16_mfu 24.03
+step 00004/00006 | tokens/sec 24382 | bf16_mfu 28.02
+step 00005/00006 | tokens/sec 23961 | bf16_mfu 27.53
+step 00006/00006 | tokens/sec 23870 | bf16_mfu 27.41
 Peak memory usage: 69524.90MiB
 
 target-only CE + diagnostic precomputed features, but naive per-token/per-image batch construction
@@ -383,6 +416,15 @@ Interpretation:
   still launched thousands of tiny GPU ops per step.
 - Vectorized multimodal construction plus inline SigLIP raises the realistic
   main-branch path from about `3%` to about `8%` MFU at an 18K token cap.
+- Moving image open/decode and HF CPU processing into DataLoader workers raises
+  the same realistic inline-SigLIP path to about `24-28%` MFU after the first
+  worker warmup step. This matches nanoVLM/InternVL's simple pattern: workers
+  return pinned CPU `pixel_values`, and the main process runs H2D plus SigLIP.
+- The train script now keeps benchmark/generation eval separate from cheap
+  validation loss. `vlm_train.py` can run target-token validation CE every
+  `--eval-every` steps over a small held-out visual-instruction split using the
+  same worker `pixel_values` path. `vlm_eval.py` remains the heavier
+  MMStar/ScienceQA/ChartQA/MMMU/TextVQA verifier, analogous to CORE/ChatCORE.
 - Diagnostic precomputed features isolated the projector+LLM path and restored
   that path to the experiment branch regime: roughly `24-26%` steady at an 18K
   token cap, with the 20K cap reaching `25-29%` before OOM.

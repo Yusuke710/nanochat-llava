@@ -59,14 +59,17 @@ def build_train_cmd(
     num_iterations: int = 1000,
     batch_size: int = 128,
     max_batch_tokens: int = 12000,
+    max_examples: int = -1,
     run: str = "dummy",
     model_step: int = 650,
-    hf_repo: str = "HuggingFaceM4/FineVisionMax",
+    hf_repo: str = "HuggingFaceM4/the_cauldron",
+    hf_config: str = "vqav2",
     no_save: bool = False,
     require_fa3_varlen: bool = False,
     log_every: int = 10,
     num_workers: int = 4,
     eval_every: int = 200,
+    eval_tokens: int = 524288,
 ):
     cmd = [
         "python",
@@ -76,6 +79,8 @@ def build_train_cmd(
         run,
         "--hf-repo",
         hf_repo,
+        "--hf-config",
+        hf_config,
         "--out-dir",
         out_dir,
         "--device-type",
@@ -94,8 +99,12 @@ def build_train_cmd(
         str(num_workers),
         "--eval-every",
         str(eval_every),
+        "--eval-tokens",
+        str(eval_tokens),
         "--skip-bad-images",
     ]
+    if max_examples > 0:
+        cmd += ["--max-examples", str(max_examples)]
     if no_save:
         cmd += ["--no-save"]
     else:
@@ -140,7 +149,7 @@ def _run(cmd):
 @app.function(gpu=GPU_TYPE, volumes={"/vol": VOL}, timeout=60 * 30)
 def doctor():
     print("GPU_TYPE", GPU_TYPE, flush=True)
-    _run(build_train_cmd(num_iterations=1, batch_size=1, eval_every=-1, no_save=True))
+    _run(build_train_cmd(num_iterations=1, batch_size=1, max_examples=1, no_save=True))
 
 
 @app.function(gpu=GPU_TYPE, volumes={"/vol": VOL}, timeout=60 * 20)
@@ -154,28 +163,34 @@ def train(
     num_iterations: int = 1000,
     batch_size: int = 128,
     max_batch_tokens: int = 12000,
+    max_examples: int = -1,
     run: str = "dummy",
     model_step: int = 650,
-    hf_repo: str = "HuggingFaceM4/FineVisionMax",
+    hf_repo: str = "HuggingFaceM4/the_cauldron",
+    hf_config: str = "vqav2",
     no_save: bool = False,
     require_fa3_varlen: bool = True,
     log_every: int = 10,
     num_workers: int = 4,
     eval_every: int = 200,
+    eval_tokens: int = 524288,
 ):
     _run(build_train_cmd(
         out_dir=out_dir,
         num_iterations=num_iterations,
         batch_size=batch_size,
         max_batch_tokens=max_batch_tokens,
+        max_examples=max_examples,
         run=run,
         model_step=model_step,
         hf_repo=hf_repo,
+        hf_config=hf_config,
         no_save=no_save,
         require_fa3_varlen=require_fa3_varlen,
         log_every=log_every,
         num_workers=num_workers,
         eval_every=eval_every,
+        eval_tokens=eval_tokens,
     ))
 
 

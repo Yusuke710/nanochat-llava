@@ -8,7 +8,6 @@ attend across boundaries.
 """
 
 import argparse
-import itertools
 import io
 import json
 import os
@@ -19,7 +18,7 @@ from pathlib import Path
 
 import torch
 import wandb
-from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset
 
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import DummyWandb, autodetect_device_type, compute_cleanup, compute_init, get_base_dir, get_peak_flops, print0
@@ -42,7 +41,8 @@ from nanochat.vision import (
 
 
 IMAGE_KEYS = ("image", "image_path", "filename", "path")
-DEFAULT_HF_REPO = "HuggingFaceM4/FineVisionMax"
+DEFAULT_HF_REPO = "HuggingFaceM4/the_cauldron"
+DEFAULT_HF_CONFIG = "vqav2"
 MODEL_SOURCE = "sft"
 UNTRUNCATED_MAX_TOKENS = 1_000_000_000
 INIT_LR_FRAC = 0.05
@@ -96,10 +96,10 @@ def _load_json(path: Path):
         return json.load(f)
 
 
-def _open_hf_record_stream(hf_repo: str):
+def _iter_hf_dataset_records(hf_repo: str, hf_config: str):
     from datasets import load_dataset
 
-    ds = load_dataset(hf_repo, split="train", streaming=True)
+    ds = load_dataset(hf_repo, hf_config, split="train", streaming=True)
     try:
         from datasets import Image as HFImage
         from datasets import Sequence
@@ -108,19 +108,43 @@ def _open_hf_record_stream(hf_repo: str):
             ds = ds.cast_column("images", Sequence(HFImage(decode=False)))
     except ImportError:
         pass
-    return ds
+    yield from ds
 
 
-def hf_source(args):
+def _iter_hf_json_records(hf_repo: str, hf_file: str):
+    from datasets import load_dataset
+
+    data_files = f"hf://datasets/{hf_repo}/{hf_file}"
+    yield from load_dataset("json", data_files=data_files, split="train", streaming=True)
+
+
+def _record_limit(args):
+    if args.max_examples > 0:
+        return args.max_examples
+    train_needed = args.device_batch_size * args.grad_accum_steps * (args.num_iterations + 1) * 2
+    return max(train_needed + args.val_examples, args.device_batch_size * 64)
+
+
+def load_records(args):
+    if args.data_json:
+        path = Path(args.data_json)
+        records = _load_json(path)
+        assert isinstance(records, list), f"expected a JSON list in {path}"
+        if args.max_examples > 0:
+            records = records[: args.max_examples]
+        return records, str(path)
+
     hf_repo = args.hf_repo or DEFAULT_HF_REPO
-    return f"stream:{hf_repo}"
-
-
-def load_local_records(path_arg):
-    path = Path(path_arg)
-    records = _load_json(path)
-    assert isinstance(records, list), f"expected a JSON list in {path}"
-    return records, str(path)
+    hf_config = args.hf_config or DEFAULT_HF_CONFIG
+    source = f"stream:{hf_repo}/{args.hf_file or hf_config}"
+    iterator = _iter_hf_json_records(hf_repo, args.hf_file) if args.hf_file else _iter_hf_dataset_records(hf_repo, hf_config)
+    records = []
+    for rec in iterator:
+        records.append(rec)
+        if len(records) >= _record_limit(args):
+            break
+    assert records, f"streamed no records from {source}"
+    return records, f"{source} first {len(records):,} rows"
 
 
 def _image_value(record):
@@ -201,43 +225,20 @@ def supervised_target_count(tokens, mask, image_token_id=IMAGE_TOKEN_ID):
     return count
 
 
-def render_record(rec, tokenizer, max_seq_len=2048):
-    if _image_value(rec) is None:
-        return None
-    tokens, mask = render_vision_conversation(tokenizer, _ensure_image_marker_in_conversation(rec), max_tokens=UNTRUNCATED_MAX_TOKENS)
-    if count_image_tokens(tokens) != 1 or count_image_tokens(tokens[:-1]) != 1:
-        return None
-    expanded_len = expanded_input_len(tokens)
-    if expanded_len > max_seq_len:
-        return None
-    if supervised_target_count(tokens, mask) <= 0:
-        return None
-    return {"tokens": tokens, "mask": mask, "record": rec, "expanded_len": expanded_len}
-
-
 def render_records(records, tokenizer, max_seq_len=2048):
     rendered = []
     for rec in records:
-        example = render_record(rec, tokenizer, max_seq_len=max_seq_len)
-        if example is not None:
-            rendered.append(example)
+        if _image_value(rec) is None:
+            continue
+        tokens, mask = render_vision_conversation(tokenizer, _ensure_image_marker_in_conversation(rec), max_tokens=UNTRUNCATED_MAX_TOKENS)
+        if count_image_tokens(tokens) != 1 or count_image_tokens(tokens[:-1]) != 1:
+            continue
+        if expanded_input_len(tokens) > max_seq_len:
+            continue
+        if supervised_target_count(tokens, mask) > 0:
+            rendered.append({"tokens": tokens, "mask": mask, "record": rec, "expanded_len": expanded_input_len(tokens)})
     assert rendered, "no usable image-text examples loaded"
     return rendered
-
-
-def collect_rendered_examples(records, tokenizer, max_seq_len=2048, limit=DEFAULT_VAL_EXAMPLES):
-    if limit <= 0:
-        return [], 0
-    rendered = []
-    seen = 0
-    for rec in records:
-        seen += 1
-        example = render_record(rec, tokenizer, max_seq_len=max_seq_len)
-        if example is not None:
-            rendered.append(example)
-            if len(rendered) >= limit:
-                break
-    return rendered, seen
 
 
 def split_train_val_examples(examples, val_examples=DEFAULT_VAL_EXAMPLES, use_val=True):
@@ -344,83 +345,6 @@ class PackedVisionBatchDataset(Dataset):
         }
 
 
-class StreamingVisionBatchDataset(IterableDataset):
-    """FineVisionMax streaming microbatches with online token packing."""
-
-    def __init__(
-        self,
-        args,
-        tokenizer,
-        siglip_cache_dir=None,
-        skip_records=0,
-    ):
-        self.hf_repo = args.hf_repo or DEFAULT_HF_REPO
-        self.batch_size = args.device_batch_size
-        self.max_batch_tokens = args.max_batch_tokens
-        self.max_seq_len = args.max_seq_len
-        self.siglip_model_id = args.siglip_model_id
-        self.siglip_cache_dir = siglip_cache_dir
-        self.image_root = args.image_root
-        self.image_zip = args.image_zip
-        self.skip_bad_images = args.skip_bad_images
-        self.tokenizer = tokenizer
-        self.skip_records = skip_records
-        self.processor = None
-
-    def _processor(self):
-        if self.processor is None:
-            from transformers import AutoImageProcessor
-
-            kwargs = {"cache_dir": self.siglip_cache_dir} if self.siglip_cache_dir else {}
-            self.processor = AutoImageProcessor.from_pretrained(self.siglip_model_id, **kwargs)
-        return self.processor
-
-    def _record_stream(self, worker_id, num_workers):
-        ds = _open_hf_record_stream(self.hf_repo)
-        if self.skip_records > 0:
-            ds = ds.skip(self.skip_records) if hasattr(ds, "skip") else itertools.islice(ds, self.skip_records, None)
-        return itertools.islice(ds, worker_id, None, num_workers)
-
-    def _pack_batch(self, examples):
-        images, kept = open_images(examples, self.image_root, self.image_zip, self.skip_bad_images)
-        if not images:
-            return None
-        pixel_values = self._processor()(images=images, return_tensors="pt")["pixel_values"]
-        rows, masks, pixel_values, image_counts, segment_lengths = pack_examples(kept, pixel_values)
-        return {
-            "rows": rows,
-            "masks": masks,
-            "pixel_values": pixel_values,
-            "image_counts": image_counts,
-            "segment_lengths": segment_lengths,
-            "num_examples": len(kept),
-        }
-
-    def __iter__(self):
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
-        batch = []
-        total_len = 0
-        for rec in self._record_stream(worker_id, num_workers):
-            example = render_record(rec, self.tokenizer, max_seq_len=self.max_seq_len)
-            if example is None:
-                continue
-            candidate_len = int(example["expanded_len"])
-            if batch and self.max_batch_tokens > 0 and total_len + candidate_len > self.max_batch_tokens:
-                yield self._pack_batch(batch)
-                batch = []
-                total_len = 0
-            batch.append(example)
-            total_len += candidate_len
-            if len(batch) >= self.batch_size:
-                yield self._pack_batch(batch)
-                batch = []
-                total_len = 0
-        if batch:
-            yield self._pack_batch(batch)
-
-
 def build_training_batches(examples, num_batches, batch_size, max_batch_tokens, seed):
     examples = list(examples)
     rng = random.Random(seed)
@@ -441,7 +365,14 @@ def num_eval_batches(eval_tokens, max_batch_tokens, batch_size, max_seq_len):
     return max(1, (eval_tokens + tokens_per_batch - 1) // tokens_per_batch)
 
 
-def build_batch_loader(args, tokenizer, siglip_cache_dir, device_type, num_batches=None, seed=0, examples=None, skip_records=0):
+def build_batch_loader(args, examples, siglip_cache_dir, device_type, num_batches, seed):
+    batches = build_training_batches(
+        examples,
+        num_batches=num_batches,
+        batch_size=args.device_batch_size,
+        max_batch_tokens=args.max_batch_tokens,
+        seed=seed,
+    )
     workers = max(0, args.num_workers)
     kwargs = {
         "batch_size": None,
@@ -455,30 +386,14 @@ def build_batch_loader(args, tokenizer, siglip_cache_dir, device_type, num_batch
         })
         if device_type == "cuda":
             kwargs["multiprocessing_context"] = "spawn"
-    if examples is None:
-        dataset = StreamingVisionBatchDataset(
-            args,
-            tokenizer,
-            siglip_cache_dir=siglip_cache_dir,
-            skip_records=skip_records,
-        )
-    else:
-        assert num_batches is not None
-        batches = build_training_batches(
-            examples,
-            num_batches=num_batches,
-            batch_size=args.device_batch_size,
-            max_batch_tokens=args.max_batch_tokens,
-            seed=seed,
-        )
-        dataset = PackedVisionBatchDataset(
-            batches,
-            args.siglip_model_id,
-            siglip_cache_dir=siglip_cache_dir,
-            image_root=args.image_root,
-            image_zip=args.image_zip,
-            skip_bad_images=args.skip_bad_images,
-        )
+    dataset = PackedVisionBatchDataset(
+        batches,
+        args.siglip_model_id,
+        siglip_cache_dir=siglip_cache_dir,
+        image_root=args.image_root,
+        image_zip=args.image_zip,
+        skip_bad_images=args.skip_bad_images,
+    )
     return DataLoader(dataset, **kwargs)
 
 
@@ -617,9 +532,12 @@ def main():
     parser.add_argument("--run", type=str, default="dummy")
     parser.add_argument("--data-json", default=None)
     parser.add_argument("--hf-repo", default=DEFAULT_HF_REPO)
+    parser.add_argument("--hf-file", default=None)
+    parser.add_argument("--hf-config", default=DEFAULT_HF_CONFIG)
     parser.add_argument("--image-zip", default=None)
     parser.add_argument("--image-root", default=None)
     parser.add_argument("--skip-bad-images", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-examples", type=int, default=-1)
     parser.add_argument("--siglip-model-id", default=SIGLIP_MODEL_ID)
     parser.add_argument("--siglip-cache-dir", default=None)
     parser.add_argument("--hf-checkpoint", default="karpathy/nanochat-d32")
@@ -666,40 +584,18 @@ def main():
     args.matrix_lr = user_config.get("matrix_lr", 0.02)
     args.scalar_lr = user_config.get("scalar_lr", 0.5)
 
-    use_val = args.eval_every > 0 and args.eval_tokens > 0
     t = time.perf_counter()
-    val_records_seen = 0
-    if args.data_json:
-        records, data_path = load_local_records(args.data_json)
-        examples = render_records(records, tokenizer, max_seq_len=args.max_seq_len)
-        train_examples, val_examples = split_train_val_examples(
-            examples,
-            val_examples=args.val_examples,
-            use_val=use_val,
-        )
-        train_desc = f"{len(train_examples):,}"
-        print0(
-            f"Loaded {len(records):,} records and rendered {len(train_examples):,} train / "
-            f"{len(val_examples):,} val examples in {time.perf_counter() - t:.2f}s"
-        )
-    else:
-        data_path = hf_source(args)
-        train_examples = None
-        val_examples = []
-        if use_val and args.val_examples > 0:
-            val_stream = _open_hf_record_stream(args.hf_repo or DEFAULT_HF_REPO)
-            val_examples, val_records_seen = collect_rendered_examples(
-                val_stream,
-                tokenizer,
-                max_seq_len=args.max_seq_len,
-                limit=args.val_examples,
-            )
-            assert val_examples, f"streamed no usable validation examples from {data_path}"
-        train_desc = f"stream after {val_records_seen:,} validation-scan records"
-        print0(
-            f"Prepared {data_path} with {train_desc} / {len(val_examples):,} val examples "
-            f"in {time.perf_counter() - t:.2f}s"
-        )
+    records, data_path = load_records(args)
+    examples = render_records(records, tokenizer, max_seq_len=args.max_seq_len)
+    train_examples, val_examples = split_train_val_examples(
+        examples,
+        val_examples=args.val_examples,
+        use_val=args.eval_every > 0 and args.eval_tokens > 0,
+    )
+    print0(
+        f"Loaded {len(records):,} records and rendered {len(train_examples):,} train / "
+        f"{len(val_examples):,} val examples in {time.perf_counter() - t:.2f}s"
+    )
 
     siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
     extractor = SigLIPPooledFeatureExtractor(args.siglip_model_id, device=device, cache_dir=siglip_cache_dir, verbose=ddp_rank == 0)
@@ -718,25 +614,14 @@ def main():
     projector.train()
     llm_optimizer = setup_llm_optimizer(model, args)
     projector_optimizer = torch.optim.AdamW(projector.parameters(), lr=args.projector_lr, weight_decay=0.0)
-    if train_examples is None:
-        batch_loader = build_batch_loader(
-            args,
-            tokenizer,
-            siglip_cache_dir,
-            device_type,
-            seed=args.seed,
-            skip_records=val_records_seen,
-        )
-    else:
-        batch_loader = build_batch_loader(
-            args,
-            tokenizer,
-            siglip_cache_dir,
-            device_type,
-            num_batches=args.num_iterations * args.grad_accum_steps,
-            seed=args.seed,
-            examples=train_examples,
-        )
+    batch_loader = build_batch_loader(
+        args,
+        train_examples,
+        siglip_cache_dir,
+        device_type,
+        num_batches=args.num_iterations * args.grad_accum_steps,
+        seed=args.seed,
+    )
     batch_iter = iter(batch_loader)
     val_loader = None
     if val_examples:
@@ -748,12 +633,11 @@ def main():
         )
         val_loader = build_batch_loader(
             args,
-            tokenizer,
+            val_examples,
             siglip_cache_dir,
             device_type,
             num_batches=eval_batches,
             seed=args.seed + 1,
-            examples=val_examples,
         )
 
     smooth_loss = 0.0
@@ -766,7 +650,7 @@ def main():
     trunk_flops_per_token = max(0.0, flops_per_token - lm_head_flops_per_token)
     total_params = count_params(model.parameters()) + count_params(projector.parameters())
     total_trainable = count_params(p for p in list(model.parameters()) + list(projector.parameters()) if p.requires_grad)
-    print0(f"VLM | GPU: {gpu_name} | train: {train_desc} | val: {len(val_examples):,} | data: {data_path} | out: {out_dir}")
+    print0(f"VLM | GPU: {gpu_name} | train: {len(train_examples):,} | val: {len(val_examples):,} | data: {data_path} | out: {out_dir}")
     print0(f"Params total/trainable: {total_params:,}/{total_trainable:,}")
     print0(f"FLOPs/token: {flops_per_token:e} | Peak BF16 FLOPS: {gpu_peak_flops:.2e}")
     if device_type == "cuda":

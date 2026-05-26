@@ -37,13 +37,12 @@ from scripts.vlm_eval import (
     parse_inline_options,
 )
 from scripts.vlm_train import (
-    collect_rendered_examples,
     evaluate_vlm_loss,
     get_lr_multiplier,
+    load_records,
     next_batch,
     num_eval_batches,
     open_image,
-    _open_hf_record_stream,
     open_images,
     render_records,
     save_training_checkpoint,
@@ -283,13 +282,15 @@ def test_training_checkpoint_metadata_records_vision_config(tmp_path):
     args = SimpleNamespace(
         data_json=None,
         hf_repo="repo",
+        hf_file="file.json",
+        max_examples=10,
         image_root="/images",
         image_zip=None,
         skip_bad_images=True,
         siglip_model_id="google/siglip-base-patch16-512",
     )
     model_meta = {"model_config": {"n_embd": 32}}
-    save_training_checkpoint(tmp_path, 3, model, projector, args, model_meta, "stream:repo", rank=0)
+    save_training_checkpoint(tmp_path, 3, model, projector, args, model_meta, "stream:repo/file.json", rank=0)
     _, _, _, meta = load_vlm_checkpoint(tmp_path, 3, torch.device("cpu"))
     assert meta["vision_config"]["vision_tokens"] == VISION_TOKENS
     assert meta["vision_config"]["projector_vision_dim"] == projector.vision_dim
@@ -365,20 +366,21 @@ def test_evaluate_vlm_loss_restores_train_mode():
     assert projector.training
 
 
-def test_hf_record_stream_uses_native_streaming(monkeypatch):
+def test_load_records_streams_hf_json(monkeypatch):
     streamed = [{"image": f"{i}.jpg", "caption": f"caption {i}"} for i in range(5)]
 
     def fake_load_dataset(*args, **kwargs):
         assert kwargs["streaming"] is True
-        assert kwargs["split"] == "train"
         return iter(streamed)
 
     monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
-    records = list(_open_hf_record_stream("repo"))
-    assert records == streamed
+    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file="file.json", hf_config=None, max_examples=3, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
+    records, source = load_records(args)
+    assert len(records) == 3
+    assert source == "stream:repo/file.json first 3 rows"
 
 
-def test_streaming_finevision_schema_renders_validation_slice(monkeypatch):
+def test_load_records_and_render_finevision_schema(monkeypatch):
     streamed = [
         {
             "images": [Image.new("RGB", (4, 4), color=(1, 2, 3))],
@@ -387,25 +389,17 @@ def test_streaming_finevision_schema_renders_validation_slice(monkeypatch):
         for _ in range(2)
     ]
 
-    def fake_load_dataset(repo, **kwargs):
+    def fake_load_dataset(repo, config, **kwargs):
         assert repo == "repo"
+        assert config == "cfg"
         assert kwargs["streaming"] is True
-        assert kwargs["split"] == "train"
         return iter(streamed)
 
-    class HFImage:
-        def __init__(self, decode=False):
-            self.decode = decode
-
-    class Sequence:
-        def __init__(self, feature):
-            self.feature = feature
-
-    datasets = types.SimpleNamespace(load_dataset=fake_load_dataset, Image=HFImage, Sequence=Sequence)
-    monkeypatch.setitem(sys.modules, "datasets", datasets)
-    records = _open_hf_record_stream("repo")
-    rendered, seen = collect_rendered_examples(records, TinyTokenizer(), max_seq_len=256, limit=1)
-    assert seen == 1
+    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
+    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file=None, hf_config="cfg", max_examples=1, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
+    records, source = load_records(args)
+    rendered = render_records(records, TinyTokenizer(), max_seq_len=256)
+    assert source == "stream:repo/cfg first 1 rows"
     assert len(rendered) == 1
     assert count_image_tokens(rendered[0]["tokens"]) == 1
 
@@ -490,14 +484,13 @@ def test_lr_schedule_and_modal_command_builders():
 
     import modal_vlm
 
-    train_cmd = modal_vlm.build_train_cmd(no_save=True, require_fa3_varlen=True)
+    train_cmd = modal_vlm.build_train_cmd(max_examples=8, no_save=True, require_fa3_varlen=True)
     assert train_cmd[:3] == ["python", "-m", "scripts.vlm_train"]
-    assert train_cmd[train_cmd.index("--hf-repo") + 1] == "HuggingFaceM4/FineVisionMax"
-    assert "--hf-config" not in train_cmd
+    assert train_cmd[train_cmd.index("--hf-repo") + 1] == "HuggingFaceM4/the_cauldron"
+    assert train_cmd[train_cmd.index("--hf-config") + 1] == "vqav2"
     assert "--require-fa3-varlen" in train_cmd
     assert "--no-save" in train_cmd
-    assert "--max-" + "examples" not in train_cmd
-    assert "--eval-tokens" not in train_cmd
+    assert "--eval-tokens" in train_cmd
     assert "--eval-steps" not in train_cmd
     assert "--profile-timing" not in train_cmd
     assert "--fp8" not in train_cmd

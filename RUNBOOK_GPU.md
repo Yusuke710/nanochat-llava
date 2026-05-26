@@ -29,21 +29,22 @@ uv run python -m pytest tests/test_vision.py tests/test_vlm_smoke.py -q
 ```bash
 uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --run dummy \
-  --hf-repo HuggingFaceM4/FineVisionMax \
+  --hf-repo HuggingFaceM4/the_cauldron \
+  --hf-config vqav2 \
   --out-dir "$DATA_ROOT/checkpoints/vlm" \
   --device-type cuda \
   --num-iterations 1000 \
   --device-batch-size 128 \
   --max-batch-tokens 12000 \
   --model-step 650 \
+  --eval-tokens 524288 \
   --save-every 1000 \
   --require-fa3-varlen
 ```
 
 `--device-batch-size` is the number of candidate image-text examples. The actual
 LLM batch is one compact packed row whose examples are separated by FA3 varlen
-attention boundaries. The default HF source is the precombined FineVisionMax
-stream, so the trainer does not apply an extra local streaming shuffle.
+attention boundaries.
 
 ## Modal
 
@@ -52,7 +53,7 @@ NANOCHAT_MODAL_GPU=H100 uv run --extra vision modal run modal_vlm.py::train \
   --num-iterations 6 \
   --batch-size 768 \
   --max-batch-tokens 18000 \
-  --eval-every -1 \
+  --max-examples 1024 \
   --no-save \
   --log-every 1
 ```

@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -105,7 +105,22 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if cu_seqlens is None:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                assert int(cu_seqlens[-1].item()) == B * T, "compact varlen batches must contain no padding"
+                flat_y = flash_attn.flash_attn_varlen_func(
+                    q.reshape(B * T, self.n_head, self.head_dim),
+                    k.reshape(B * T, self.n_kv_head, self.head_dim),
+                    v.reshape(B * T, self.n_kv_head, self.head_dim),
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=True,
+                    window_size=window_size,
+                )
+                y = flat_y.view(B, T, self.n_head, self.head_dim)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -145,8 +160,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -417,7 +432,21 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', input_embeds=None, value_token_ids=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction='mean',
+        input_embeds=None,
+        value_token_ids=None,
+        position_ids=None,
+        segment_starts=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        loss_indices=None,
+        loss_targets=None,
+    ):
         if input_embeds is None:
             B, T = idx.size()
         else:
@@ -427,14 +456,35 @@ class GPT(nn.Module):
         idx_for_values = idx if value_token_ids is None else value_token_ids
         assert idx_for_values is not None, "value token ids are required"
         assert idx_for_values.shape == (B, T), f"value token ids shape {idx_for_values.shape} != {(B, T)}"
+        if position_ids is not None:
+            assert kv_cache is None, "custom position ids are training-only"
+            assert position_ids.shape == (B, T), f"position ids shape {position_ids.shape} != {(B, T)}"
+        if segment_starts is not None:
+            assert kv_cache is None, "packed segment starts are training-only"
+            assert segment_starts.shape == (B, T), f"segment starts shape {segment_starts.shape} != {(B, T)}"
+        if cu_seqlens is not None:
+            assert kv_cache is None, "varlen attention is training-only"
+            assert cu_seqlens.ndim == 1 and cu_seqlens.dtype == torch.int32
+            assert max_seqlen is not None
+        if loss_indices is not None or loss_targets is not None:
+            assert targets is not None or loss_targets is not None, "targets or loss_targets required"
+            assert loss_indices is not None and loss_targets is not None, "loss_indices and loss_targets must be passed together"
+            assert loss_indices.ndim == 1 and loss_targets.ndim == 1
+            assert loss_indices.shape == loss_targets.shape
+            assert loss_indices.device == idx_for_values.device
+            assert loss_targets.device == idx_for_values.device
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx_for_values.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx_for_values.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        if position_ids is None:
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        else:
+            assert int(position_ids.max().item()) < self.cos.size(1), "packed position id exceeded rotary cache"
+            cos_sin = self.cos[0, position_ids], self.sin[0, position_ids]
 
         # Embed the tokens
         x = self.transformer.wte(idx) if input_embeds is None else input_embeds # embed current token or use prebuilt multimodal embeddings
@@ -446,7 +496,10 @@ class GPT(nn.Module):
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            smear = gate * x[:, :-1]
+            if segment_starts is not None:
+                smear = smear * (~segment_starts[:, 1:]).to(dtype=x.dtype).unsqueeze(-1)
+            x = torch.cat([x[:, :1], x[:, 1:] + smear], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
@@ -468,7 +521,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx_for_values).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -478,6 +531,23 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        if loss_indices is not None:
+            assert loss_indices.numel() > 0, "need at least one supervised target"
+            x_flat = x.view(-1, x.size(-1))
+            logits = self.lm_head(x_flat.index_select(0, loss_indices))
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+            losses = F.cross_entropy(logits, loss_targets, reduction="none")
+            if loss_reduction == "none":
+                loss = torch.zeros((B * T,), dtype=losses.dtype, device=x.device)
+                loss.index_copy_(0, loss_indices, losses)
+                return loss.view(B, T)
+            if loss_reduction == "sum":
+                return losses.sum()
+            assert loss_reduction == "mean", f"unsupported loss_reduction: {loss_reduction}"
+            return losses.mean()
+
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation

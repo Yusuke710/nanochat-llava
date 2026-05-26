@@ -6,21 +6,21 @@ were intentionally removed to keep the implementation minimal.
 
 ## Current live code snapshot
 
-- `nanochat/vision.py`: `<image>` marker handling, frozen SigLIP base patch-16/512, nanoVLM-style 8x8 pixel-shuffle pooling to 64 visual tokens, linear projector, single-image visual-token insertion, target masking, generation helper, VLM checkpoint helpers, and HF nanochat-d32 linking.
-- `nanochat/gpt.py`: thin optional `input_embeds` / `value_token_ids` hook in `GPT.forward`; ordinary text-only `model(idx, targets)` behavior is preserved.
+- `nanochat/vision.py`: `<image>` marker handling, frozen SigLIP base patch-16/512, nanoVLM-style 8x8 pixel-shuffle pooling to 64 visual tokens, linear projector, vectorized visual-token insertion, target masking, generation helper, VLM checkpoint helpers, and HF nanochat-d32 linking.
+- `nanochat/gpt.py`: thin optional `input_embeds` / `value_token_ids` / varlen-boundary / target-index hooks in `GPT.forward`; ordinary text-only `model(idx, targets)` behavior is preserved.
 - `nanochat/checkpoint_manager.py`: compatibility patching for old `karpathy/nanochat-d32` checkpoint keys missing from the current GPT module.
-- `scripts/vlm_train.py`: two-stage VLM trainer. Stage 1 freezes nanochat and SigLIP, trains only the projector. Stage 2 freezes SigLIP, trains projector plus nanochat. Stage 2 defaults to FineVision `LLaVA_Instruct_150K`, using the nanoVLM-style `images` + `texts` schema with embedded image bytes. Legacy HF JSON rows still stream when `--hf-file` is passed. Optional `--eval-every` runs a small VLM benchmark loop during training.
+- `scripts/vlm_train.py`: one visual-instruction trainer. It starts from `karpathy/nanochat-d32`, freezes SigLIP, trains the linear projector plus nanochat, packs many image-text examples into one compact row, and enforces boundaries with varlen FlashAttention. It supports JSON/HF rows and keeps SigLIP inline in the training step.
 - `scripts/vlm_eval.py`: verifier subset runner for MMStar, ScienceQA, ChartQA, MMMU, and TextVQA. It exposes `evaluate_vlm(...)` for training-time checks, and the CLI evaluates one checkpoint, stores scores and sample generations, and leaves checkpoint-to-checkpoint comparisons outside the script.
 - `tests/test_vision.py` and `tests/test_vlm_smoke.py`: focused unit tests plus synthetic image-conditioned overfit/control smoke. The smoke now lives in tests, not scripts.
-- `modal_vlm.py`: minimal Modal wrapper with `doctor`, `smoke`, `stage1`, `stage2`, and `eval` only. Default GPU is `A100-80GB`; set `NANOCHAT_MODAL_GPU=H100` to switch.
-- `RUNBOOK_GPU.md`: external-GPU runbook, streamed-data behavior, Stage 1/Stage 2/eval commands, and go/no-go criteria.
+- `modal_vlm.py`: minimal Modal wrapper with `doctor`, `smoke`, `train`, and `eval` only. Default GPU is `A100-80GB`; set `NANOCHAT_MODAL_GPU=H100` to switch.
+- `RUNBOOK_GPU.md`: external-GPU runbook with one train command, one MFU-probe-shaped Modal command, and one eval command.
 
 ## Pitfalls to avoid
 
-- Do not re-add `vlm_precompute_siglip.py`, online feature caches, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, or benchmark report generators unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.
-- Keep inline SigLIP for v0. For streamed LLaVA, images are mostly unique, so a repeated-image cache is not aligned with the data path.
+- Do not re-add `vlm_precompute_siglip.py`, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, benchmark report generators, FP8 probes, profiling grids, or frozen-feature training shortcuts unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.
+- Keep inline SigLIP for v0 so the main path reflects real training.
 - Do not judge success from aggregate benchmark numbers alone. Compare separate checkpoint eval JSONs and inspect stored sample generations.
-- Stage 2 can start directly from the SFT d32 checkpoint or from a Stage 1 projector checkpoint when explicitly testing that path. Old non-pixel-shuffle checkpoints are incompatible with the current `12288` projector input dimension.
+- The old Stage 1/Stage 2 split lives only in the experiment branch. Main uses one visual-instruction path.
 
 ## Current commands
 
@@ -32,51 +32,35 @@ uv run --extra vision python -m scripts.vlm_train --help
 uv run --extra vision python -m scripts.vlm_eval --help
 ```
 
-Modal smoke and staged run:
+Modal smoke, MFU-shaped probe, and eval:
 
 ```bash
 uv run --extra vision modal run modal_vlm.py::doctor
 uv run --extra vision modal run modal_vlm.py::smoke
 
-uv run --extra vision modal run modal_vlm.py::stage1 \
-  --out-dir /vol/checkpoints/stage1_pixshuffle_250 \
-  --num-iterations 250 \
-  --batch-size 32 \
-  --max-examples 16000
+NANOCHAT_MODAL_GPU=H100 uv run --extra vision modal run modal_vlm.py::train \
+  --num-iterations 6 \
+  --batch-size 768 \
+  --max-batch-tokens 18000 \
+  --max-examples 1024 \
+  --no-save \
+  --log-every 1
 
 uv run --extra vision modal run modal_vlm.py::eval \
-  --checkpoint-dir /vol/checkpoints/stage1_pixshuffle_250 \
-  --checkpoint-step 250 \
-  --out /vol/bench/stage1_pixshuffle_250.json \
+  --checkpoint-dir /vol/checkpoints/vlm \
+  --checkpoint-step 1000 \
+  --out /vol/checkpoints/vlm_eval.json \
   --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
   --limit 16 \
-  --max-scan 240 \
-  --print-samples 3
-
-uv run --extra vision modal run modal_vlm.py::stage2 \
-  --out-dir /vol/checkpoints/stage2_direct_finevision_probe \
-  --num-iterations 100 \
-  --batch-size 24 \
-  --max-batch-tokens 12000 \
-  --max-examples 4096 \
-  --profile-timing
-
-uv run --extra vision modal run modal_vlm.py::eval \
-  --checkpoint-dir /vol/checkpoints/stage2_direct_finevision_probe \
-  --checkpoint-step 100 \
-  --out /vol/bench/stage2_direct_finevision_probe.json \
-  --benchmarks mmstar,scienceqa,chartqa,mmmu,textvqa \
-  --limit 16 \
-  --max-scan 240 \
-  --print-samples 3
+  --max-scan 240
 ```
 
 ## Remaining proof
 
-The local code path is ready for a scaled probe, but model-quality success is
-not proven until a real GPU run produces a training-time eval trail or standalone
-Stage 1/Stage 2 eval JSONs. Compare scores and sample generations across
-checkpoints before launching longer training.
+The local code path is ready for a longer visual-instruction run, but
+model-quality success is not proven until a real GPU run produces standalone VLM
+eval JSONs. Compare scores and sample generations across checkpoints before
+launching longer training.
 
 
 # nanochat-llava GPU Probe Notes
@@ -308,3 +292,103 @@ Interpretation:
 - Stage 2 learned during the 100-step probe: loss decreased from `1.80` to `1.46`, controls passed throughout, and ScienceQA improved clearly over Stage 1 and zero-image on this small eval slice.
 - ChartQA did not improve. Its generations became more fluent but remained visually/numerically wrong, and the control check failed.
 - The benchmark limit was only 16 examples per task, so these numbers are directional rather than statistically stable.
+
+## Main branch simplification and MFU check, 2026-05-26
+
+The larger MFU/profiling branch was snapshotted as `experiment/mfu-varlen-fa3`
+at `55a4f21`. Main was then simplified back to a nanochat-shaped V0 path:
+frozen SigLIP, projector, nanochat training, and strict varlen FlashAttention
+boundaries. The SigLIP batch/chunk knob, VLM FP8 experiments, profile timers,
+and MFU grid machinery were removed from the main training script.
+
+Short Modal H100 checks on `HuggingFaceM4/the_cauldron/vqav2`:
+
+```text
+max_batch_tokens=12000, max_examples=512, steps=4
+step 00004/00004 | loss 1.530354 | samples/sec 14.82 | tokens/sec 2444 | bf16_mfu 2.99
+Peak memory usage: 64526.58MiB
+
+max_batch_tokens=16000, max_examples=768, steps=6
+step 00002/00006 | loss 1.578618 | samples/sec 15.38 | tokens/sec 2456 | bf16_mfu 3.00
+step 00003/00006 | loss 1.544003 | samples/sec 15.50 | tokens/sec 2454 | bf16_mfu 3.00
+step 00004/00006 | loss 1.487748 | samples/sec 15.17 | tokens/sec 2384 | bf16_mfu 2.91
+step 00005/00006 | loss 1.486309 | samples/sec 16.29 | tokens/sec 2502 | bf16_mfu 3.06
+step 00006/00006 | loss 1.448560 | samples/sec 14.53 | tokens/sec 2460 | bf16_mfu 3.00
+Peak memory usage: 78495.79MiB
+```
+
+Interpretation:
+
+- The simplified main branch compiles and the strict varlen FA3 path trains on
+  H100.
+- Increasing the packed-token cap from 12K to 16K did not materially raise
+  useful tokens/sec; it mostly consumed the remaining H100 memory.
+- The first simplified rewrite was too naive: it used full dense logits for all
+  ignored visual/prompt positions and constructed multimodal batches with many
+  tiny `wte(token)` and per-image projector calls.
+
+Follow-up fixes kept the same CE objective but made the implementation closer to
+the experiment branch's efficient path:
+
+- Added target-only logits via `loss_indices` / `loss_targets`. This is the same
+  ignore-index cross-entropy as nanochat, but it skips the vocab projection for
+  labels that are ignored.
+- Added optional frozen SigLIP feature caching for finite runs. This moves image
+  encoding out of the measured training step when SigLIP is frozen.
+- Replaced the naive multimodal builder with a vectorized version: one embedding
+  lookup for `value_token_ids`, one projector call for all visual features, and
+  indexed insertion of the 64 visual embeddings.
+
+Modal H100 follow-up on the simplified main branch:
+
+```text
+target-only CE + vectorized multimodal construction + inline SigLIP
+max_batch_tokens=18000, max_examples=1024, steps=6
+step 00002/00006 | tokens/sec 6989 | bf16_mfu 8.03
+step 00003/00006 | tokens/sec 7228 | bf16_mfu 8.30
+step 00004/00006 | tokens/sec 7733 | bf16_mfu 8.89
+step 00005/00006 | tokens/sec 7136 | bf16_mfu 8.20
+step 00006/00006 | tokens/sec 6956 | bf16_mfu 7.99
+Peak memory usage: 69524.90MiB
+
+target-only CE + diagnostic precomputed features, but naive per-token/per-image batch construction
+max_batch_tokens=20000, max_examples=1024, steps=6
+step 00002/00006 | tokens/sec 3705 | bf16_mfu 5.04
+step 00006/00006 | tokens/sec 3635 | bf16_mfu 4.95
+Peak memory usage: 74301.75MiB
+
+target-only CE + diagnostic precomputed features + vectorized multimodal construction
+max_batch_tokens=20000, max_examples=1024, steps=6
+step 00002/00006 | tokens/sec 23723 | bf16_mfu 27.25
+step 00003/00006 | tokens/sec 21629 | bf16_mfu 24.85
+step 00004/00006 | tokens/sec 23708 | bf16_mfu 27.24
+step 00005/00006 | tokens/sec 25121 | bf16_mfu 28.86
+Result: OOM on step 6 near the 80GB memory edge.
+
+target-only CE + diagnostic precomputed features + vectorized multimodal construction
+max_batch_tokens=18000, max_examples=1024, steps=6
+step 00002/00006 | tokens/sec 21642 | bf16_mfu 24.86
+step 00003/00006 | tokens/sec 21222 | bf16_mfu 24.38
+step 00004/00006 | tokens/sec 22730 | bf16_mfu 26.12
+step 00005/00006 | tokens/sec 22248 | bf16_mfu 25.56
+step 00006/00006 | tokens/sec 22061 | bf16_mfu 25.34
+Peak memory usage: 69211.61MiB
+```
+
+Interpretation:
+
+- The `3%` result was a regression in the simplified main implementation, not a
+  limit of varlen FA3.
+- Target-only CE alone did not restore MFU because the naive multimodal builder
+  still launched thousands of tiny GPU ops per step.
+- Vectorized multimodal construction plus inline SigLIP raises the realistic
+  main-branch path from about `3%` to about `8%` MFU at an 18K token cap.
+- Diagnostic precomputed features isolated the projector+LLM path and restored
+  that path to the experiment branch regime: roughly `24-26%` steady at an 18K
+  token cap, with the 20K cap reaching `25-29%` before OOM.
+- The remaining gap to text-only nanochat is still the old one: the 80GB VLM path
+  fits about 18-20K packed tokens with this model and no checkpointing, not the
+  much larger per-rank text batch used in the nanochat speedrun. With inline
+  SigLIP, there is also real vision-encoder time inside every optimizer step.
+- The diagnostic precomputed-feature shortcut was useful for attribution but is
+  not part of main because real v0 training keeps SigLIP inline.

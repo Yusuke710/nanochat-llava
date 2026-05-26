@@ -12,13 +12,11 @@ from __future__ import annotations
 import copy
 import math
 import os
-import time
 from dataclasses import dataclass
 from typing import Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
 from nanochat.gpt import Linear
@@ -42,6 +40,14 @@ class MultimodalBatch:
     value_token_ids: torch.Tensor
     targets: torch.Tensor | None
     lengths: torch.Tensor
+    position_ids: torch.Tensor | None = None
+    segment_starts: torch.Tensor | None = None
+    cu_seqlens: torch.Tensor | None = None
+    max_seqlen: int | None = None
+    segment_lengths: list[int] | None = None
+    token_count: int | None = None
+    loss_indices: torch.Tensor | None = None
+    loss_targets: torch.Tensor | None = None
 
 
 class VisionProjector(nn.Module):
@@ -136,32 +142,11 @@ class SigLIPPooledFeatureExtractor:
             print(f"Loaded SigLIP vision model patch_dim={self.patch_dim} projected_feature_dim={self.vision_dim}", flush=True)
 
     @torch.no_grad()
-    def __call__(self, images, profile=None, synchronize=None) -> torch.Tensor:
-        sync = synchronize or (lambda: None)
-        t = time.perf_counter()
+    def __call__(self, images) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt")
-        if profile is not None:
-            profile["image_processor"] += time.perf_counter() - t
-            sync()
-
-        t = time.perf_counter()
         pixel_values = inputs["pixel_values"].to(device=self.device, dtype=self.dtype)
-        if profile is not None:
-            sync()
-            profile["image_transfer"] += time.perf_counter() - t
-
-        t = time.perf_counter()
         out = self.model(pixel_values=pixel_values)
-        if profile is not None:
-            sync()
-            profile["siglip_forward"] += time.perf_counter() - t
-
-        t = time.perf_counter()
-        pooled = pool_siglip_features(out.last_hidden_state, output_grid=self.output_grid)
-        if profile is not None:
-            sync()
-            profile["siglip_pool"] += time.perf_counter() - t
-        return pooled
+        return pool_siglip_features(out.last_hidden_state, output_grid=self.output_grid)
 
 
 def encode_with_image_markers(tokenizer, text: str, image_token_id: int = IMAGE_TOKEN_ID) -> list[int]:
@@ -270,6 +255,8 @@ def build_multimodal_batch(
     ignore_index: int = IGNORE_INDEX,
     max_seq_len: int | None = None,
     value_fallback_token_id: int | None = None,
+    image_counts_per_row: list[int] | None = None,
+    segment_token_lengths_per_row: list[list[int]] | None = None,
 ) -> MultimodalBatch:
     """
     Build GPT inputs by expanding each image sentinel in token_rows[:-1] to 64 projected tokens.
@@ -285,79 +272,144 @@ def build_multimodal_batch(
     if loss_mask_rows is None:
         loss_mask_rows = [[1] * len(row) for row in token_rows]
     assert len(loss_mask_rows) == batch_size
+    if image_counts_per_row is None:
+        image_counts_per_row = [1] * batch_size
+    assert len(image_counts_per_row) == batch_size
+    assert sum(image_counts_per_row) == image_features.size(0), (
+        f"feature batch {image_features.size(0)} != image markers {sum(image_counts_per_row)}"
+    )
+    if segment_token_lengths_per_row is None:
+        segment_token_lengths_per_row = [[len(row)] for row in token_rows]
+    assert len(segment_token_lengths_per_row) == batch_size
     if value_fallback_token_id is None:
         value_fallback_token_id = int(token_rows[0][0])
         assert value_fallback_token_id >= 0, "first token must be a real token when no fallback is provided"
     assert image_features.ndim == 3, f"expected image_features (B, 64, C), got {image_features.shape}"
-    assert image_features.size(0) == batch_size, f"feature batch {image_features.size(0)} != token batch {batch_size}"
 
-    embed_rows: list[torch.Tensor] = []
-    value_rows: list[torch.Tensor] = []
-    target_rows: list[torch.Tensor] = []
+    value_rows: list[list[int]] = []
+    target_rows: list[list[int]] = []
+    position_rows: list[list[int]] = []
+    segment_start_rows: list[list[bool]] = []
+    visual_spans: list[tuple[int, int, int]] = []
+    flat_segment_lengths: list[int] = []
     lengths: list[int] = []
-    embed_dtype = wte.weight.dtype
+    feature_cursor = 0
 
     for row_idx, (row, mask_row) in enumerate(zip(token_rows, loss_mask_rows)):
+        expected_images = int(image_counts_per_row[row_idx])
+        segment_token_lengths = [int(length) for length in segment_token_lengths_per_row[row_idx]]
         assert len(row) == len(mask_row), "token and mask rows must have the same length"
         assert len(row) >= 2, "need at least two tokens to build shifted targets"
-        assert count_image_tokens(row[:-1], image_token_id) == 1, "v0 expects exactly one <image> marker per row"
-        chunks: list[torch.Tensor] = []
-        value_chunks: list[torch.Tensor] = []
-        target_chunks: list[torch.Tensor] = []
+        assert segment_token_lengths and all(length > 1 for length in segment_token_lengths), "segments must have at least two tokens"
+        assert sum(segment_token_lengths) == len(row), "segment lengths must sum to row length"
+        values: list[int] = []
+        targets_row: list[int] = []
+        positions: list[int] = []
+        segment_starts_row: list[bool] = []
+        segment_idx = 0
+        segment_end = segment_token_lengths[0]
+        segment_pos = 0
+        row_images = 0
 
         for i, tok in enumerate(row[:-1]):
+            while i >= segment_end and segment_idx + 1 < len(segment_token_lengths):
+                segment_idx += 1
+                segment_end += segment_token_lengths[segment_idx]
+                segment_pos = 0
             tok = int(tok)
+            if i + 1 == segment_end and segment_idx + 1 < len(segment_token_lengths):
+                assert tok != image_token_id, "packed segment boundary token cannot be an image marker"
+                flat_segment_lengths.append(segment_pos)
+                continue
             next_tok = int(row[i + 1])
             supervise_next = int(mask_row[i + 1]) == 1
             if tok == image_token_id:
-                feats = image_features[row_idx]
-                assert feats.shape[0] == VISION_TOKENS, f"expected {VISION_TOKENS} visual tokens, got {feats.shape[0]}"
-                if hasattr(feats, "is_inference") and feats.is_inference():
-                    feats = feats.clone()
-                feats = feats.to(device=device, dtype=embed_dtype if embed_dtype != torch.float16 else torch.float32)
-                visual_embeds = projector(feats).to(device=device)
-                chunks.append(visual_embeds)
-                value_chunks.append(torch.full((VISION_TOKENS,), value_fallback_token_id, dtype=torch.long, device=device))
-                visual_targets = torch.full((VISION_TOKENS,), ignore_index, dtype=torch.long, device=device)
-                target_chunks.append(visual_targets)
+                assert row_images < expected_images, f"row {row_idx} has more <image> markers than expected"
+                visual_spans.append((row_idx, len(values), feature_cursor))
+                feature_cursor += 1
+                row_images += 1
+                values.extend([value_fallback_token_id] * VISION_TOKENS)
+                targets_row.extend([ignore_index] * VISION_TOKENS)
+                positions.extend(range(segment_pos, segment_pos + VISION_TOKENS))
+                segment_starts_row.extend([segment_pos == 0] + [False] * (VISION_TOKENS - 1))
+                segment_pos += VISION_TOKENS
             else:
-                token = torch.tensor([tok], dtype=torch.long, device=device)
-                chunks.append(wte(token))
-                value_chunks.append(token)
                 target = next_tok if next_tok != image_token_id and supervise_next else ignore_index
-                target_chunks.append(torch.tensor([target], dtype=torch.long, device=device))
+                values.append(tok)
+                targets_row.append(target)
+                positions.append(segment_pos)
+                segment_starts_row.append(segment_pos == 0)
+                segment_pos += 1
+        assert row_images == expected_images, f"consumed {row_images} image features, expected {expected_images}"
+        flat_segment_lengths.append(segment_pos)
 
-        embeds = torch.cat(chunks, dim=0)
-        values = torch.cat(value_chunks, dim=0)
-        targets = torch.cat(target_chunks, dim=0)
-        if max_seq_len is not None and embeds.size(0) > max_seq_len:
-            embeds = embeds[:max_seq_len]
+        if max_seq_len is not None and len(values) > max_seq_len:
             values = values[:max_seq_len]
-            targets = targets[:max_seq_len]
-        embed_rows.append(embeds)
+            targets_row = targets_row[:max_seq_len]
+            positions = positions[:max_seq_len]
+            segment_starts_row = segment_starts_row[:max_seq_len]
+            flat_segment_lengths[-1] = min(flat_segment_lengths[-1], max_seq_len)
         value_rows.append(values)
-        target_rows.append(targets)
-        lengths.append(embeds.size(0))
+        target_rows.append(targets_row)
+        position_rows.append(positions)
+        segment_start_rows.append(segment_starts_row)
+        lengths.append(len(values))
+    assert feature_cursor == image_features.size(0), f"consumed {feature_cursor} image features, had {image_features.size(0)}"
 
     max_len = max(lengths)
-    pad_embed = wte(torch.tensor([value_fallback_token_id], dtype=torch.long, device=device))[0]
-    input_embeds = torch.stack([
-        torch.cat([row, pad_embed.expand(max_len - row.size(0), -1)], dim=0) if row.size(0) < max_len else row
-        for row in embed_rows
-    ])
-    value_token_ids = torch.stack([
-        F.pad(row, (0, max_len - row.size(0)), value=value_fallback_token_id) if row.size(0) < max_len else row
-        for row in value_rows
-    ])
-    targets = torch.stack([
-        F.pad(row, (0, max_len - row.size(0)), value=ignore_index) if row.size(0) < max_len else row
-        for row in target_rows
-    ])
+    value_token_ids = torch.tensor(
+        [row + [value_fallback_token_id] * (max_len - len(row)) for row in value_rows],
+        dtype=torch.long,
+        device=device,
+    )
+    targets = torch.tensor(
+        [row + [ignore_index] * (max_len - len(row)) for row in target_rows],
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = torch.tensor(
+        [row + [0] * (max_len - len(row)) for row in position_rows],
+        dtype=torch.long,
+        device=device,
+    )
+    segment_starts = torch.tensor(
+        [row + [False] * (max_len - len(row)) for row in segment_start_rows],
+        dtype=torch.bool,
+        device=device,
+    )
+    input_embeds = wte(value_token_ids)
+    if visual_spans:
+        assert image_features.size(1) == VISION_TOKENS, f"expected {VISION_TOKENS} visual tokens, got {image_features.size(1)}"
+        feats = image_features
+        if hasattr(feats, "is_inference") and feats.is_inference():
+            feats = feats.clone()
+        feats = feats.to(device=device, dtype=wte.weight.dtype if wte.weight.dtype != torch.float16 else torch.float32)
+        projected = projector(feats.reshape(-1, feats.size(-1))).to(device=device, dtype=input_embeds.dtype)
+        projected = projected.view(image_features.size(0), VISION_TOKENS, -1)
+        for row_idx, start, feature_idx in visual_spans:
+            end = min(start + VISION_TOKENS, max_len)
+            if end > start:
+                input_embeds[row_idx, start:end] = projected[feature_idx, : end - start]
+    cu_values = [0]
+    for length in flat_segment_lengths:
+        cu_values.append(cu_values[-1] + int(length))
+    cu_seqlens = torch.tensor(cu_values, dtype=torch.int32, device=device)
+    flat_targets = targets.view(-1)
+    loss_indices = (flat_targets != ignore_index).nonzero(as_tuple=False).flatten()
+    loss_targets = flat_targets.index_select(0, loss_indices)
     return MultimodalBatch(
         input_embeds=input_embeds,
         value_token_ids=value_token_ids,
         targets=targets,
         lengths=torch.tensor(lengths, dtype=torch.long, device=device),
+        position_ids=position_ids,
+        segment_starts=segment_starts,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max(flat_segment_lengths),
+        segment_lengths=flat_segment_lengths,
+        token_count=sum(lengths),
+        loss_indices=loss_indices,
+        loss_targets=loss_targets,
     )
 
 

@@ -63,6 +63,15 @@ def _resolve_use_fa3():
 USE_FA3 = _resolve_use_fa3()
 
 
+def has_fa3_varlen():
+    return bool(USE_FA3 and _fa3 is not None and hasattr(_fa3, "flash_attn_varlen_func"))
+
+
+def require_fa3_varlen():
+    if not has_fa3_varlen():
+        raise RuntimeError("FlashAttention 3 varlen attention is required but unavailable")
+
+
 # =============================================================================
 # SDPA helpers
 # =============================================================================
@@ -101,6 +110,33 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
+
+def _sdpa_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, window_size):
+    """
+    Correctness fallback for flattened packed training attention.
+
+    q/k/v are (total_tokens, heads, head_dim). cu_seqlens splits the flat
+    stream into independent causal segments. H100 training should use FA3's
+    varlen kernel; this path keeps CPU and non-Hopper tests honest.
+    """
+    del max_seqlen_q, max_seqlen_k
+    q_offsets = [int(x) for x in cu_seqlens_q.detach().cpu()]
+    k_offsets = [int(x) for x in cu_seqlens_k.detach().cpu()]
+    assert len(q_offsets) == len(k_offsets)
+    out = []
+    for qs, qe, ks, ke in zip(q_offsets[:-1], q_offsets[1:], k_offsets[:-1], k_offsets[1:]):
+        if qe == qs:
+            continue
+        qi = q[qs:qe].unsqueeze(0).transpose(1, 2)
+        ki = k[ks:ke].unsqueeze(0).transpose(1, 2)
+        vi = v[ks:ke].unsqueeze(0).transpose(1, 2)
+        enable_gqa = qi.size(1) != ki.size(1)
+        yi = _sdpa_attention(qi, ki, vi, window_size, enable_gqa)
+        out.append(yi.transpose(1, 2).squeeze(0))
+    if not out:
+        return q.new_empty((0, q.size(1), q.size(2)))
+    return torch.cat(out, dim=0)
+
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -126,6 +162,33 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     enable_gqa = q.size(1) != k.size(1)
     y = _sdpa_attention(q, k, v, window_size, enable_gqa)
     return y.transpose(1, 2)  # back to (B, T, H, D)
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    causal=False,
+    window_size=(-1, -1),
+):
+    assert causal, "nanochat VLM only uses causal varlen attention"
+    if has_fa3_varlen():
+        return _fa3.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            window_size=window_size,
+        )
+    return _sdpa_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, window_size)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
@@ -183,5 +246,6 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
+    flash_attn_varlen_func=flash_attn_varlen_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
 )

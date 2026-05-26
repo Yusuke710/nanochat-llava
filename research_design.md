@@ -10,7 +10,7 @@ checkpoint on 1 GPU by adding:
 
 - a frozen or lightly configurable vision encoder
 - a small projector from vision features into nanochat token embedding space
-- two vision training stages: projector alignment, then image-only VLM training
+- one visual-instruction training path: freeze SigLIP, train the projector plus nanochat
 
 The end state should still feel like nanochat: small code surface, readable files, few knobs, and no framework-like configuration system.
 
@@ -32,26 +32,23 @@ The end state should still feel like nanochat: small code surface, readable file
 
 ```text
 karpathy/nanochat-d32 checkpoint
--> VLM stage 1: freeze LLM and SigLIP, train projector
--> VLM stage 2: freeze SigLIP, train projector and LLM on image data
+-> VLM train: freeze SigLIP, train projector and LLM on image data
 ```
 
 - Use `SigLIP base patch-16/512` as the first vision encoder target, about 93M parameters.
-- Keep the vision encoder frozen in both VLM stages for v0.
-- Precompute pooled SigLIP features where possible, ideally asynchronously, so VLM training can consume tensors and keep MFU close to text-only training.
+- Keep the vision encoder frozen for v0.
 - Use simple pooling for visual-token compression.
 - Start with an `8x8` pooled grid, i.e. 64 visual tokens per image.
 - Use a LLaVA-style literal `<image>` marker in text and replace it with projected visual tokens in the model input stream.
 - Start with a linear projector from SigLIP feature dimension to nanochat embedding dimension.
-- Do not mix text-only data into VLM stage 2 for v0. Keep it image-only until the simple LLaVA path works.
-- Mask image-token targets out of the loss. Use assistant-only masking for conversation data and caption-only masking for caption data.
+- Do not mix text-only data into VLM training for v0. Keep it image-only until the simple LLaVA path works.
+- Mask image-token targets out of the loss. Use assistant-only masking for conversation data.
 - Preserve all text-only nanochat paths unless vision is explicitly enabled.
 
 ## V0 Data
 
 - Use LLaVA data for the first implementation.
-- Stage 1 data: LLaVA pretrain image-caption data.
-- Stage 2 data: LLaVA visual instruction data.
+- Training data: visual instruction data.
 - Do not curate FineVision for v0. FineVision or a visual-only FineVision subset is a later scale-up option.
 
 ## V0 Benchmarks

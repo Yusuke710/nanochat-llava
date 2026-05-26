@@ -38,7 +38,6 @@ from scripts.vlm_eval import (
 )
 from scripts.vlm_train import (
     batch_features_and_examples,
-    evaluate_vlm_bpb,
     get_lr_multiplier,
     load_records,
     next_batch,
@@ -166,10 +165,75 @@ def test_visual_token_insertion_and_target_masking():
     assert targets[1].item() == -1
     assert torch.all(targets[2 : 2 + VISION_TOKENS] == -1)
     assert targets[-1].item() == 12
-    assert torch.isfinite(model(batch.value_token_ids, batch.targets, input_embeds=batch.input_embeds))
+    valid = (batch.targets.view(-1) != -1).nonzero(as_tuple=False).flatten()
+    torch.testing.assert_close(batch.loss_indices.cpu(), valid.cpu())
+    torch.testing.assert_close(batch.loss_targets.cpu(), batch.targets.view(-1).index_select(0, valid).cpu())
+    full_loss = model(batch.value_token_ids, batch.targets, input_embeds=batch.input_embeds)
+    target_only_loss = model(
+        batch.value_token_ids,
+        batch.targets,
+        input_embeds=batch.input_embeds,
+        loss_indices=batch.loss_indices,
+        loss_targets=batch.loss_targets,
+    )
+    assert torch.isfinite(target_only_loss)
+    torch.testing.assert_close(target_only_loss, full_loss, rtol=1e-5, atol=1e-5)
 
-    with pytest.raises(AssertionError, match="exactly one"):
+    with pytest.raises(AssertionError, match="consumed 0 image features"):
         build_multimodal_batch(model, projector, [[1, 10, 11]], features, loss_mask_rows=[[1, 1, 1]], value_fallback_token_id=1)
+
+
+def test_boundary_aware_varlen_packed_loss_matches_separate_examples():
+    model, projector = tiny_model()
+    with torch.no_grad():
+        model.smear_lambda.fill_(1.0)
+    row1 = [1, 10, IMAGE_TOKEN_ID, 11, 12]
+    row2 = [1, 20, IMAGE_TOKEN_ID, 21, 22]
+    mask1 = [1] * len(row1)
+    mask2 = [1] * len(row2)
+    features = torch.randn(2, VISION_TOKENS, 8)
+
+    separate = build_multimodal_batch(
+        model,
+        projector,
+        [row1, row2],
+        features,
+        loss_mask_rows=[mask1, mask2],
+        value_fallback_token_id=1,
+    )
+    separate_loss = model(
+        separate.value_token_ids,
+        separate.targets,
+        input_embeds=separate.input_embeds,
+        loss_reduction="sum",
+    )
+
+    packed = build_multimodal_batch(
+        model,
+        projector,
+        [row1 + row2],
+        features,
+        loss_mask_rows=[mask1 + mask2],
+        image_counts_per_row=[2],
+        segment_token_lengths_per_row=[[len(row1), len(row2)]],
+        max_seq_len=None,
+        value_fallback_token_id=1,
+    )
+    assert packed.cu_seqlens.tolist() == [0, int(separate.lengths[0]), int(separate.lengths.sum())]
+    assert packed.segment_starts[0, 0]
+    assert packed.segment_starts[0, int(separate.lengths[0])]
+    assert int(packed.position_ids[0, int(separate.lengths[0])]) == 0
+    packed_loss = model(
+        packed.value_token_ids,
+        packed.targets,
+        input_embeds=packed.input_embeds,
+        position_ids=packed.position_ids,
+        segment_starts=packed.segment_starts,
+        cu_seqlens=packed.cu_seqlens,
+        max_seqlen=packed.max_seqlen,
+        loss_reduction="sum",
+    )
+    torch.testing.assert_close(packed_loss, separate_loss, rtol=1e-5, atol=1e-5)
 
 
 def test_text_only_gpt_path_and_embed_hook_match():
@@ -213,19 +277,14 @@ def test_hf_nanochat_d32_links_to_sft_layout(tmp_path, monkeypatch):
 def test_training_checkpoint_metadata_records_vision_config(tmp_path):
     model, projector = tiny_model()
     args = SimpleNamespace(
-        stage=2,
         data_json=None,
         hf_repo="repo",
         hf_file="file.json",
-        stream_hf_data=True,
         max_examples=10,
         image_root="/images",
         image_zip=None,
-        hf_image_zip=None,
         skip_bad_images=True,
         siglip_model_id="google/siglip-base-patch16-512",
-        init_vlm_checkpoint_dir="/tmp/stage1",
-        init_vlm_checkpoint_step=1,
     )
     model_meta = {"model_config": {"n_embd": 32}}
     save_training_checkpoint(tmp_path, 3, model, projector, args, model_meta, "stream:repo/file.json", rank=0)
@@ -266,7 +325,7 @@ def test_load_records_streams_hf_json(monkeypatch):
         return iter(streamed)
 
     monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
-    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file="file.json", stage=1, stream_hf_data=True, max_examples=3, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
+    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file="file.json", hf_config=None, max_examples=3, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
     records, source = load_records(args)
     assert len(records) == 3
     assert source == "stream:repo/file.json first 3 rows"
@@ -288,7 +347,7 @@ def test_load_records_and_render_finevision_schema(monkeypatch):
         return iter(streamed)
 
     monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
-    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file=None, hf_config="cfg", stage=2, max_examples=1, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
+    args = SimpleNamespace(data_json=None, hf_repo="repo", hf_file=None, hf_config="cfg", max_examples=1, device_batch_size=2, grad_accum_steps=1, num_iterations=1)
     records, source = load_records(args)
     rendered = render_records(records, TinyTokenizer(), stage=2, max_seq_len=256)
     assert source == "stream:repo/cfg first 1 rows"
@@ -328,45 +387,6 @@ def test_batch_features_can_skip_dead_images(tmp_path):
     feats, kept = batch_features_and_examples(Extractor(), examples, tmp_path, skip_bad_images=True)
     assert len(kept) == 1
     assert feats.shape == (1, VISION_TOKENS, 2)
-
-
-def test_vlm_bpb_eval_scores_supervised_targets(tmp_path):
-    Image.new("RGB", (4, 4), color=(1, 2, 3)).save(tmp_path / "tiny.jpg")
-    records = [{
-        "image": "tiny.jpg",
-        "conversations": [
-            {"from": "human", "value": f"{IMAGE_MARKER}\nWhat color?"},
-            {"from": "gpt", "value": "red"},
-        ],
-    }]
-    tokenizer = TinyTokenizer()
-    examples = render_records(records, tokenizer, stage=2, max_seq_len=128)
-    model, projector = tiny_model()
-    model.train()
-    projector.train()
-
-    class Extractor:
-        def __call__(self, images):
-            return torch.randn(len(images), VISION_TOKENS, 8)
-
-    stats = evaluate_vlm_bpb(
-        model,
-        projector,
-        Extractor(),
-        examples,
-        tmp_path,
-        None,
-        torch.device("cpu"),
-        torch.ones(tokenizer.get_vocab_size(), dtype=torch.long),
-        batch_size=1,
-        max_seq_len=128,
-    )
-    assert stats["n"] == 1
-    assert stats["bytes"] > 0
-    assert stats["target_tokens"] > 0
-    assert torch.isfinite(torch.tensor(stats["bpb"]))
-    assert model.training
-    assert projector.training
 
 
 def test_eval_prompt_matching_and_samples():
@@ -418,28 +438,15 @@ def test_lr_schedule_and_modal_command_builders():
 
     import modal_vlm
 
-    stage1 = modal_vlm.build_stage1_cmd(max_examples=8)
-    assert stage1[:3] == ["python", "-m", "scripts.vlm_train"]
-    assert stage1[stage1.index("--stage") + 1] == "1"
-    assert stage1[stage1.index("--hf-file") + 1] == "blip_laion_cc_sbu_558k.json"
-    assert stage1[stage1.index("--hf-image-zip") + 1] == "images.zip"
-    assert "--skip-bad-images" in stage1
-    assert "--feature-cache-dir" not in stage1
+    train_cmd = modal_vlm.build_train_cmd(max_examples=8, no_save=True, require_fa3_varlen=True)
+    assert train_cmd[:3] == ["python", "-m", "scripts.vlm_train"]
+    assert train_cmd[train_cmd.index("--hf-repo") + 1] == "HuggingFaceM4/the_cauldron"
+    assert train_cmd[train_cmd.index("--hf-config") + 1] == "vqav2"
+    assert "--require-fa3-varlen" in train_cmd
+    assert "--no-save" in train_cmd
+    assert "--profile-timing" not in train_cmd
+    assert "--fp8" not in train_cmd
 
-    stage2 = modal_vlm.build_stage2_cmd(init_checkpoint_step=250, max_examples=4, profile_timing=True)
-    assert stage2[stage2.index("--stage") + 1] == "2"
-    assert stage2[stage2.index("--hf-repo") + 1] == "HuggingFaceM4/FineVision"
-    assert stage2[stage2.index("--hf-config") + 1] == "LLaVA_Instruct_150K"
-    assert "--hf-file" not in stage2
-    assert "--image-url-template" not in stage2
-    assert "--init-vlm-checkpoint-dir" not in stage2
-    assert "--profile-timing" in stage2
-    assert "--pack-examples" not in stage2
-
-    stage2_from_stage1 = modal_vlm.build_stage2_cmd(init_checkpoint_dir="/stage1", init_checkpoint_step=250)
-    assert stage2_from_stage1[stage2_from_stage1.index("--init-vlm-checkpoint-dir") + 1] == "/stage1"
-    assert stage2_from_stage1[stage2_from_stage1.index("--init-vlm-checkpoint-step") + 1] == "250"
-
-    eval_cmd = modal_vlm.build_eval_cmd(limit=3, max_scan=9, benchmarks="mmstar,chartqa", print_samples=2)
+    eval_cmd = modal_vlm.build_eval_cmd(limit=3, max_scan=9, benchmarks="mmstar,chartqa")
     assert eval_cmd[:3] == ["python", "-m", "scripts.vlm_eval"]
     assert eval_cmd[eval_cmd.index("--benchmarks") + 1] == "mmstar,chartqa"

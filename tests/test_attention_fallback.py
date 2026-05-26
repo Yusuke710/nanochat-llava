@@ -16,7 +16,7 @@ Note on test structure:
 import torch
 import pytest
 import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
+from nanochat.flash_attention import attention_backend_info, flash_attn, has_fa3_varlen, require_fa3_varlen, HAS_FA3
 from nanochat.engine import KVCache
 
 
@@ -257,6 +257,17 @@ class TestSDPAOnly:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
+    def test_attention_backend_info_reports_varlen_backend(self):
+        info = attention_backend_info()
+        assert "varlen_backend" in info
+        assert info["varlen_backend"] in {"fa3", "sdpa"}
+        assert info["has_fa3_varlen"] == has_fa3_varlen()
+        if has_fa3_varlen():
+            require_fa3_varlen()
+        else:
+            with pytest.raises(RuntimeError, match="FA3 varlen attention is required"):
+                require_fa3_varlen()
+
     def test_basic_forward(self):
         """Test SDPA forward pass produces valid output."""
         set_impl('sdpa')
@@ -269,6 +280,42 @@ class TestSDPAOnly:
 
         assert y.shape == (B, T, H, D)
         assert not torch.isnan(y).any(), "Output contains NaN"
+        set_impl(None)
+
+    def test_varlen_matches_per_segment_attention(self):
+        """Varlen fallback should match running each segment independently."""
+        set_impl('sdpa')
+        lengths = [3, 5, 2]
+        total = sum(lengths)
+        H, D = 4, 16
+        q = torch.randn(total, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(total, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(total, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu = torch.tensor([0, 3, 8, 10], dtype=torch.int32, device=self.DEVICE)
+
+        y = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(lengths),
+            max(lengths),
+            causal=True,
+            window_size=(-1, -1),
+        )
+        expected = []
+        for start, end in zip(cu[:-1].tolist(), cu[1:].tolist()):
+            expected.append(
+                flash_attn.flash_attn_func(
+                    q[start:end].unsqueeze(0),
+                    k[start:end].unsqueeze(0),
+                    v[start:end].unsqueeze(0),
+                    causal=True,
+                    window_size=(-1, -1),
+                ).squeeze(0)
+            )
+        torch.testing.assert_close(y, torch.cat(expected, dim=0))
         set_impl(None)
 
     def test_backward(self):

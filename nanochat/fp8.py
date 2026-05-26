@@ -131,6 +131,13 @@ class _Float8Matmul(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_2d, weight):
+        orig_rows = input_2d.size(0)
+        pad_rows = (-orig_rows) % 16
+        if pad_rows:
+            input_2d = torch.cat([input_2d, input_2d.new_zeros((pad_rows, input_2d.size(1)))], dim=0)
+        ctx.orig_rows = orig_rows
+        ctx.pad_rows = pad_rows
+
         # Quantize both operands to e4m3 (higher precision format)
         input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
         weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
@@ -151,11 +158,15 @@ class _Float8Matmul(torch.autograd.Function):
             # the forward pass; we use False in backward for more precise gradients.
             use_fast_accum=True,
         )
+        if pad_rows:
+            output = output[:orig_rows]
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
+        if ctx.pad_rows:
+            grad_output = torch.cat([grad_output, grad_output.new_zeros((ctx.pad_rows, grad_output.size(1)))], dim=0)
 
         # === GEMM 1: grad_input = grad_output @ weight ===
         # Shapes: [B, N] @ [N, K] -> [B, K]
@@ -172,6 +183,8 @@ class _Float8Matmul(torch.autograd.Function):
             out_dtype=grad_output.dtype,
             use_fast_accum=False,
         )
+        if ctx.pad_rows:
+            grad_input = grad_input[:ctx.orig_rows]
 
         # === GEMM 2: grad_weight = grad_output.T @ input ===
         # Shapes: [N, B] @ [B, K] -> [N, K]

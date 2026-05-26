@@ -127,7 +127,23 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
+    ve_keys = [
+        f"value_embeds.{layer_idx}.weight"
+        for layer_idx in range(model_config.n_layer)
+        if has_ve(layer_idx, model_config.n_layer)
+    ]
+    missing_ve_keys = [key for key in ve_keys if key not in model_data]
+    ve_gate_keys = [
+        f"transformer.h.{layer_idx}.attn.ve_gate.weight"
+        for layer_idx in range(model_config.n_layer)
+        if has_ve(layer_idx, model_config.n_layer)
+    ]
+    missing_ve_gate_keys = [key for key in ve_gate_keys if key not in model_data]
     _patch_missing_keys(model_data, model_config)
+    meta_data.setdefault("compatibility_patches", {})
+    meta_data["compatibility_patches"]["expected_value_embed_keys"] = ve_keys
+    meta_data["compatibility_patches"]["missing_value_embed_keys"] = missing_ve_keys
+    meta_data["compatibility_patches"]["missing_value_gate_keys"] = missing_ve_gate_keys
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state

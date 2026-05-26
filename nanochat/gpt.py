@@ -79,7 +79,18 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(
+        self,
+        x,
+        ve,
+        cos_sin,
+        window_size,
+        kv_cache,
+        segment_ids=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        varlen_indices=None,
+    ):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -105,7 +116,34 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if cu_seqlens is not None:
+                flat_q_all = q.reshape(B * T, self.n_head, self.head_dim)
+                flat_k_all = k.reshape(B * T, self.n_kv_head, self.head_dim)
+                flat_v_all = v.reshape(B * T, self.n_kv_head, self.head_dim)
+                if varlen_indices is None:
+                    flat_q, flat_k, flat_v = flat_q_all, flat_k_all, flat_v_all
+                else:
+                    flat_q = flat_q_all.index_select(0, varlen_indices)
+                    flat_k = flat_k_all.index_select(0, varlen_indices)
+                    flat_v = flat_v_all.index_select(0, varlen_indices)
+                flat_y = flash_attn.flash_attn_varlen_func(
+                    flat_q,
+                    flat_k,
+                    flat_v,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=True,
+                    window_size=window_size,
+                )
+                if varlen_indices is None:
+                    y = flat_y.view(B, T, self.n_head, self.head_dim)
+                else:
+                    y = q.new_zeros(B * T, self.n_head, self.head_dim)
+                    y = y.index_copy(0, varlen_indices, flat_y).view(B, T, self.n_head, self.head_dim)
+            else:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, segment_ids=segment_ids)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -145,8 +183,29 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(
+        self,
+        x,
+        ve,
+        cos_sin,
+        window_size,
+        kv_cache,
+        segment_ids=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        varlen_indices=None,
+    ):
+        x = x + self.attn(
+            norm(x),
+            ve,
+            cos_sin,
+            window_size,
+            kv_cache,
+            segment_ids=segment_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            varlen_indices=varlen_indices,
+        )
         x = x + self.mlp(norm(x))
         return x
 
@@ -314,9 +373,10 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def estimate_flops(self):
+    def estimate_flops_components(self, sequence_len: int | None = None):
         """
-        Return the estimated FLOPs per token for the model (forward + backward).
+        Return estimated non-attention and attention FLOPs per token.
+
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
         On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
@@ -332,15 +392,23 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        h, q = self.config.n_head, self.config.n_embd // self.config.n_head
+        t = self.config.sequence_len if sequence_len is None else int(sequence_len)
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
-        return num_flops_per_token
+        non_attn_flops = 6 * (nparams - nparams_exclude)
+        return non_attn_flops, attn_flops
+
+    def estimate_flops(self, sequence_len: int | None = None):
+        """
+        Return the estimated FLOPs per token for the model (forward + backward).
+        """
+        non_attn_flops, attn_flops = self.estimate_flops_components(sequence_len=sequence_len)
+        return non_attn_flops + attn_flops
 
     def num_scaling_params(self):
         """
@@ -369,6 +437,28 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
+        }
+
+    def drop_value_embedding_path(self):
+        """
+        Remove the optional value-embedding path after loading a checkpoint whose
+        value embeddings are known to be neutral zeros.
+
+        This preserves the forward function for old checkpoints that did not
+        contain value embeddings, while freeing the large frozen embedding tables
+        before VLM optimizer setup.
+        """
+        dropped_value_params = sum(p.numel() for p in self.value_embeds.parameters())
+        dropped_gate_params = 0
+        self.value_embeds = nn.ModuleDict()
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                dropped_gate_params += sum(p.numel() for p in block.attn.ve_gate.parameters())
+                block.attn.ve_gate = None
+        return {
+            "value_embed_params": dropped_value_params,
+            "value_gate_params": dropped_gate_params,
+            "total_params": dropped_value_params + dropped_gate_params,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
@@ -417,7 +507,26 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', input_embeds=None, value_token_ids=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction='mean',
+        input_embeds=None,
+        value_token_ids=None,
+        selective_loss=False,
+        loss_chunk_size=0,
+        position_ids=None,
+        segment_ids=None,
+        segment_starts=None,
+        segment_start_indices=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        varlen_indices=None,
+        loss_indices=None,
+        loss_targets=None,
+    ):
         if input_embeds is None:
             B, T = idx.size()
         else:
@@ -427,14 +536,37 @@ class GPT(nn.Module):
         idx_for_values = idx if value_token_ids is None else value_token_ids
         assert idx_for_values is not None, "value token ids are required"
         assert idx_for_values.shape == (B, T), f"value token ids shape {idx_for_values.shape} != {(B, T)}"
+        if position_ids is not None:
+            assert kv_cache is None, "custom position ids are only supported for training/prefill without KV cache"
+            assert position_ids.shape == (B, T), f"position ids shape {position_ids.shape} != {(B, T)}"
+        if segment_ids is not None:
+            assert kv_cache is None, "packed segment ids are only supported for training without KV cache"
+            assert segment_ids.shape == (B, T), f"segment ids shape {segment_ids.shape} != {(B, T)}"
+        if segment_starts is not None:
+            assert kv_cache is None, "packed segment starts are only supported for training without KV cache"
+            assert segment_starts.shape == (B, T), f"segment starts shape {segment_starts.shape} != {(B, T)}"
+        if segment_start_indices is not None:
+            assert kv_cache is None, "packed segment start indices are only supported for training without KV cache"
+            assert segment_start_indices.ndim == 1, "segment start indices must be flat"
+        if cu_seqlens is not None or varlen_indices is not None:
+            assert kv_cache is None, "varlen packed attention is only supported for training without KV cache"
+            assert cu_seqlens is not None and max_seqlen is not None, "cu_seqlens and max_seqlen are required for varlen attention"
+            assert cu_seqlens.ndim == 1 and cu_seqlens.dtype == torch.int32, "cu_seqlens must be flat int32"
+            if varlen_indices is not None:
+                assert varlen_indices.ndim == 1, "varlen_indices must be flat"
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx_for_values.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx_for_values.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        if position_ids is None:
+            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+            # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        else:
+            if position_ids.device.type == "cpu":
+                assert int(position_ids.max()) < self.cos.size(1), f"Position id grew beyond rotary cache: {int(position_ids.max())} >= {self.cos.size(1)}"
+            cos_sin = self.cos[0, position_ids], self.sin[0, position_ids]
 
         # Embed the tokens
         x = self.transformer.wte(idx) if input_embeds is None else input_embeds # embed current token or use prebuilt multimodal embeddings
@@ -446,7 +578,14 @@ class GPT(nn.Module):
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            smear = gate * x[:, :-1]
+            if segment_start_indices is not None:
+                smear = smear.reshape(-1, smear.size(-1))
+                smear.index_fill_(0, segment_start_indices, 0)
+                smear = smear.view(B, T - 1, C)
+            elif segment_starts is not None:
+                smear = smear * (~segment_starts[:, 1:]).to(dtype=x.dtype).unsqueeze(-1)
+            x = torch.cat([x[:, :1], x[:, 1:] + smear], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
@@ -468,7 +607,17 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx_for_values).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                kv_cache,
+                segment_ids=segment_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                varlen_indices=varlen_indices,
+            )
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -478,6 +627,96 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        if selective_loss and (targets is not None or loss_indices is not None):
+            x_flat = x.view(-1, x.size(-1))
+            if loss_indices is None:
+                assert targets is not None, "targets are required when selective loss indices are not provided"
+                targets_flat = targets.view(-1)
+                valid = targets_flat != -1
+                loss_targets = targets_flat[valid]
+                loss_x = x_flat[valid]
+            else:
+                assert loss_targets is not None, "loss_targets are required with loss_indices"
+                assert loss_indices.ndim == 1 and loss_targets.ndim == 1, "loss_indices and loss_targets must be flat"
+                assert loss_indices.shape == loss_targets.shape, "loss_indices and loss_targets must have the same shape"
+                loss_x = x_flat.index_select(0, loss_indices)
+                targets_flat = targets.view(-1) if loss_reduction == "none" and targets is not None else None
+            chunk_size = int(loss_chunk_size or 0)
+            if chunk_size > 0 and loss_x.size(0) > chunk_size:
+                chunk_losses = []
+                loss_sum = torch.zeros((), dtype=torch.float32, device=x.device)
+                for start in range(0, loss_x.size(0), chunk_size):
+                    end = min(start + chunk_size, loss_x.size(0))
+                    logits = self.lm_head(loss_x[start:end])
+                    logits = logits[..., :self.config.vocab_size] # slice to remove padding
+                    logits = logits.float() # switch to fp32 for logit softcap and loss computation
+                    logits = softcap * torch.tanh(logits / softcap) # squash the logits
+                    if loss_reduction == "none":
+                        chunk_losses.append(F.cross_entropy(logits, loss_targets[start:end], reduction="none"))
+                    else:
+                        loss_sum = loss_sum + F.cross_entropy(logits, loss_targets[start:end], reduction="sum")
+                if loss_reduction == "none":
+                    losses = torch.cat(chunk_losses, dim=0)
+                elif loss_reduction == "sum":
+                    return loss_sum
+                else:
+                    return loss_sum / loss_x.size(0)
+            else:
+                logits = self.lm_head(loss_x) # (num_valid_targets, padded_vocab_size)
+                logits = logits[..., :self.config.vocab_size] # slice to remove padding
+                logits = logits.float() # switch to fp32 for logit softcap and loss computation
+                logits = softcap * torch.tanh(logits / softcap) # squash the logits
+                if loss_reduction != "none":
+                    return F.cross_entropy(logits, loss_targets, reduction=loss_reduction)
+                losses = F.cross_entropy(logits, loss_targets, reduction="none")
+            if loss_reduction == "none":
+                loss_shape = (x_flat.size(0),) if targets_flat is None else targets_flat.shape
+                loss = torch.zeros(loss_shape, dtype=losses.dtype, device=x.device)
+                if loss_indices is None:
+                    loss[valid] = losses
+                else:
+                    loss.index_copy_(0, loss_indices, losses)
+                return loss
+
+        if targets is not None and loss_chunk_size and loss_chunk_size > 0:
+            x_flat = x.view(-1, x.size(-1))
+            targets_flat = targets.view(-1)
+            chunk_size = int(loss_chunk_size)
+            if loss_reduction == "none":
+                loss = torch.zeros(targets_flat.shape, dtype=torch.float32, device=targets.device)
+                for start in range(0, x_flat.size(0), chunk_size):
+                    end = min(start + chunk_size, x_flat.size(0))
+                    logits = self.lm_head(x_flat[start:end])
+                    logits = logits[..., :self.config.vocab_size]
+                    logits = logits.float()
+                    logits = softcap * torch.tanh(logits / softcap)
+                    loss[start:end] = F.cross_entropy(
+                        logits,
+                        targets_flat[start:end],
+                        ignore_index=-1,
+                        reduction="none",
+                    )
+                return loss
+            loss_sum = torch.zeros((), dtype=torch.float32, device=x.device)
+            for start in range(0, x_flat.size(0), chunk_size):
+                end = min(start + chunk_size, x_flat.size(0))
+                logits = self.lm_head(x_flat[start:end])
+                logits = logits[..., :self.config.vocab_size]
+                logits = logits.float()
+                logits = softcap * torch.tanh(logits / softcap)
+                loss_sum = loss_sum + F.cross_entropy(
+                    logits,
+                    targets_flat[start:end],
+                    ignore_index=-1,
+                    reduction="sum",
+                )
+            if loss_reduction == "sum":
+                return loss_sum
+            if loss_reduction == "mean":
+                valid_targets = (targets_flat != -1).sum().to(dtype=loss_sum.dtype)
+                return loss_sum / valid_targets
+            raise ValueError(f"unsupported loss_reduction: {loss_reduction}")
+
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation

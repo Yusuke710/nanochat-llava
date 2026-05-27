@@ -23,7 +23,7 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 # create a .venv local virtual environment (if it doesn't exist)
 [ -d ".venv" ] || uv venv
 # install the repo dependencies
-uv sync --extra gpu
+uv sync --extra gpu --extra vision
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
@@ -38,6 +38,8 @@ if [ -z "$WANDB_RUN" ]; then
     # by default use "dummy" : it's handled as a special case, skips logging to wandb
     WANDB_RUN=dummy
 fi
+MODEL_DEPTH=${MODEL_DEPTH:-24}
+MODEL_TAG=d$MODEL_DEPTH
 
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
@@ -69,10 +71,10 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+# d24 model by default (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth="$MODEL_DEPTH" --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run="$WANDB_RUN"
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --model-tag="$MODEL_TAG" --device-batch-size=16
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -82,14 +84,51 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --model-tag="$MODEL_TAG" --device-batch-size=16 --run="$WANDB_RUN"
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft --model-tag="$MODEL_TAG"
+
+# -----------------------------------------------------------------------------
+# VLM (teach the SFT model to use images)
+#
+# VLM training is single-GPU in v0 because it packs many image-text examples into
+# one compact row and uses FA3 varlen attention boundaries inside that process.
+
+SFT_MODEL_STEP=$(MODEL_TAG="$MODEL_TAG" python - <<'PY'
+import os
+from nanochat.checkpoint_manager import find_last_step
+from nanochat.common import get_base_dir
+
+checkpoint_dir = os.path.join(get_base_dir(), "chatsft_checkpoints", os.environ["MODEL_TAG"])
+print(find_last_step(checkpoint_dir))
+PY
+)
+
+VLM_NUM_ITERATIONS=${VLM_NUM_ITERATIONS:-1000}
+echo "Training VLM from SFT checkpoint $MODEL_TAG step $SFT_MODEL_STEP"
+
+python -m scripts.vlm_train \
+    --run="$WANDB_RUN" \
+    --hf-checkpoint="" \
+    --model-tag="$MODEL_TAG" \
+    --model-step="$SFT_MODEL_STEP" \
+    --out-dir="$NANOCHAT_BASE_DIR/vlm_checkpoints/$MODEL_TAG" \
+    --device-type=cuda \
+    --num-iterations="$VLM_NUM_ITERATIONS" \
+    --save-every="$VLM_NUM_ITERATIONS" \
+    --require-fa3-varlen
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
 
 # even better, chat with your model over a pretty WebUI ChatGPT style
 # python -m scripts.chat_web
+# or use the VLM checkpoint from the step above:
+# python -m scripts.chat_web \
+#     --source=sft \
+#     --model-tag=$MODEL_TAG \
+#     --step=$SFT_MODEL_STEP \
+#     --vlm-checkpoint-dir="$NANOCHAT_BASE_DIR/vlm_checkpoints/$MODEL_TAG" \
+#     --vlm-checkpoint-step=$VLM_NUM_ITERATIONS
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections

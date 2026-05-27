@@ -15,6 +15,15 @@ were intentionally removed to keep the implementation minimal.
 - `modal_vlm.py`: minimal Modal wrapper with `doctor`, `smoke`, `train`, and `eval` only. Default GPU is `A100-80GB`; set `NANOCHAT_MODAL_GPU=H100` to switch.
 - `RUNBOOK_GPU.md`: external-GPU runbook with one train command, one MFU-probe-shaped Modal command, and one eval command.
 
+## Current VLM format and data mix
+
+- Design choice: keep `<image>` as a human-readable data marker only. It is not added to the nanochat tokenizer. The renderer converts it to the internal sentinel `IMAGE_TOKEN_ID = -200`, and batching expands each sentinel to 64 projected SigLIP embeddings before calling the existing GPT path.
+- This is the nanochat-native extension: no tokenizer resize, no checkpoint surgery, one small multimodal hook, and ordinary text-only `GPT.forward(idx, targets)` remains unchanged.
+- Comparison note: nanoVLM owns tokenizer-level image placeholders and replaces their embeddings with projected vision features; InternVL expands an image marker into start/context/end placeholder tokens and replaces the context-token embeddings. For nanochat-llava v0, the simpler one-marker plus internal-sentinel design is the intended path.
+- FineVisionMax is mixed text/image data, not purely image-conditioned data. The current loader supports text-only, single-image, and multi-image rows, with `--max-batch-images` capping real images per microbatch.
+- Hugging Face cached dataset-server statistics for `HuggingFaceM4/FineVisionMax` report a partial 26,675-row stats sample with `texts` present on every row, mean `3.655` text entries per row, and `images` mean `0.714` images per row, median `1`, max `51`. Average item ratio in that stats sample is therefore image:text = `0.714:3.655`, about `1:5.12`.
+- Existing first-10k training-shape probe: `6,188` usable single-image rendered rows and `3,812` non-single-image/no-image rows, i.e. `61.88%` single-image renderable and `38.12%` other under that older probe. Source for cached stats: https://datasets-server.huggingface.co/statistics?dataset=HuggingFaceM4/FineVisionMax&config=default&split=train.
+
 ## Pitfalls to avoid
 
 - Do not re-add `vlm_precompute_siglip.py`, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, benchmark report generators, FP8 probes, profiling grids, or frozen-feature training shortcuts unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.

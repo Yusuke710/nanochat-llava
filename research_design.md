@@ -47,9 +47,12 @@ karpathy/nanochat-d32 checkpoint
 
 ## V0 Data
 
-- Use LLaVA data for the first implementation.
-- Training data: visual instruction data.
-- Do not curate FineVision for v0. FineVision or a visual-only FineVision subset is a later scale-up option.
+- Use `HuggingFaceM4/FineVisionMax` as the default visual-instruction data source for v0.
+- Treat FineVisionMax as the VLM-data analogue of Karpathy's switch to `karpathy/climbmix-400b-shuffle` / NVIDIA ClimbMix-400B for nanochat text pretraining: the larger cleaned mixed-data source, not a one-off LLaVA-only corpus.
+- Keep the first implementation simple: convert FineVisionMax image-text/VQA examples into the LLaVA-style `<image>` conversation format and train only on image-conditioned examples.
+- Scale reference: `nanoVLM-222M` reports about 1.7M unique `HuggingFaceM4/the_cauldron` samples, about 6 H100-hours, and 35.3% MMStar. With the older 5-epoch, max-sequence-128 setup, that is roughly 8.5M sample presentations and about 1B multimodal token-equivalents through the decoder.
+- Interpret nanoVLM as multimodal alignment / finetuning from pretrained SigLIP and language backbones, not from-scratch capability training.
+- References: https://huggingface.co/lusxvr/nanoVLM-222M, https://huggingface.co/blog/nanovlm, https://github.com/huggingface/nanoVLM.
 
 ## V0 Benchmarks
 

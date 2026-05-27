@@ -13,20 +13,24 @@ Repo/commit:
 - Use the default `HuggingFaceM4/FineVisionMax` stream. Do not add local streaming shuffle, data caps, feature caches, or resume/offset machinery unless asked.
 
 Setup:
-1. Run:
+1. Clone and enter the repo if it is not already present:
+   git clone https://github.com/Yusuke710/nanochat-llava
+   cd nanochat-llava
+
+2. Run:
    uv sync --extra vision --extra gpu
 
-2. Set persistent cache paths:
+3. Set persistent cache paths:
    export DATA_ROOT=${DATA_ROOT:-/workspace/nanochat-llava-data}
    export NANOCHAT_BASE_DIR=$DATA_ROOT/nanochat
    export HF_HOME=$DATA_ROOT/hf
    export NANOCHAT_SIGLIP_CACHE_DIR=$HF_HOME/siglip
    mkdir -p "$NANOCHAT_BASE_DIR" "$HF_HOME" "$NANOCHAT_SIGLIP_CACHE_DIR"
 
-3. Verify:
+4. Verify:
    uv run python -m pytest tests/test_vision.py tests/test_vlm_smoke.py -q
 
-4. Check whether this box has FA3 varlen. H100/H200 should; A100 usually will not:
+5. Check whether this box has FA3 varlen. H100/H200 should; A100 usually will not:
    uv run --extra vision --extra gpu python -c "from nanochat.flash_attention import has_fa3_varlen; print('FA3_VARLEN', has_fa3_varlen())"
 
    If it prints `True`, use:

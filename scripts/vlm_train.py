@@ -49,9 +49,14 @@ INIT_LR_FRAC = 0.05
 WARMDOWN_RATIO = 0.5
 _ZIP_CACHE = {}
 DEFAULT_VAL_EXAMPLES = 2048
+PACK_CANDIDATE_MULTIPLIER = 24
 
 
-def _ensure_image_marker_in_conversation(example):
+def _image_prefix(image_count):
+    return "\n".join([IMAGE_MARKER] * image_count)
+
+
+def _ensure_image_markers_in_conversation(example, image_count):
     example = dict(example)
     conv = example.get("conversations") or example.get("messages")
     if conv is None and example.get("texts") is not None:
@@ -66,8 +71,10 @@ def _ensure_image_marker_in_conversation(example):
     if conv is None:
         question = example.get("question", "Describe the image.")
         answer = example.get("answer", example.get("caption", ""))
+        if image_count > 0:
+            question = f"{_image_prefix(image_count)}\n{question}"
         example["messages"] = [
-            {"role": "user", "content": f"{IMAGE_MARKER}\n{question}"},
+            {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
         ]
         return example
@@ -75,10 +82,11 @@ def _ensure_image_marker_in_conversation(example):
     conv = [dict(msg) for msg in conv]
     key_role = "from" if "from" in conv[0] else "role"
     key_text = "value" if "value" in conv[0] else "content"
+    existing_markers = sum(str(msg.get(key_text, "")).count(IMAGE_MARKER) for msg in conv)
     for msg in conv:
         if msg[key_role] in {"human", "user"}:
-            if IMAGE_MARKER not in msg[key_text]:
-                msg[key_text] = f"{IMAGE_MARKER}\n{msg[key_text]}"
+            if image_count > 0 and existing_markers == 0:
+                msg[key_text] = f"{_image_prefix(image_count)}\n{msg[key_text]}"
             break
     if "conversations" in example:
         example["conversations"] = conv
@@ -122,17 +130,18 @@ def load_local_records(path_arg):
     return records, str(path)
 
 
-def _image_value(record):
+def image_values(record):
     images = record.get("images")
-    if images:
-        if isinstance(images, list) and len(images) == 1:
-            return images[0]
-        return None
+    if images is not None:
+        if isinstance(images, list):
+            return [image for image in images if image is not None]
+        return [images]
+    values = []
     for key in IMAGE_KEYS:
         value = record.get(key)
         if value is not None:
-            return value
-    return None
+            values.append(value)
+    return values
 
 
 def get_zip_file(image_zip):
@@ -147,8 +156,7 @@ def get_zip_file(image_zip):
     return entry
 
 
-def open_image(record, image_root=None, image_zip=None):
-    value = _image_value(record)
+def open_image_value(value, image_root=None, image_zip=None):
     if value is None:
         raise KeyError(f"record has no image field among {IMAGE_KEYS}")
     if hasattr(value, "convert"):
@@ -185,6 +193,13 @@ def open_image(record, image_root=None, image_zip=None):
     raise FileNotFoundError(f"could not find image {value!r}")
 
 
+def open_image(record, image_root=None, image_zip=None):
+    values = image_values(record)
+    if len(values) != 1:
+        raise KeyError(f"record must have exactly one image, found {len(values)}")
+    return open_image_value(values[0], image_root=image_root, image_zip=image_zip)
+
+
 def expanded_input_len(tokens):
     image_count = count_image_tokens(tokens[:-1])
     return len(tokens) - 1 + image_count * (VISION_TOKENS - 1)
@@ -201,17 +216,27 @@ def supervised_target_count(tokens, mask, image_token_id=IMAGE_TOKEN_ID):
 
 
 def render_record(rec, tokenizer, max_seq_len=2048):
-    if _image_value(rec) is None:
+    images = image_values(rec)
+    image_count = len(images)
+    if image_count > 0 and not any(image is not None for image in images):
         return None
-    tokens, mask = render_vision_conversation(tokenizer, _ensure_image_marker_in_conversation(rec), max_tokens=UNTRUNCATED_MAX_TOKENS)
-    if count_image_tokens(tokens) != 1 or count_image_tokens(tokens[:-1]) != 1:
+    conversation = _ensure_image_markers_in_conversation(rec, image_count)
+    tokens, mask = render_vision_conversation(tokenizer, conversation, max_tokens=UNTRUNCATED_MAX_TOKENS)
+    if count_image_tokens(tokens) != image_count or count_image_tokens(tokens[:-1]) != image_count:
         return None
     expanded_len = expanded_input_len(tokens)
     if expanded_len > max_seq_len:
         return None
     if supervised_target_count(tokens, mask) <= 0:
         return None
-    return {"tokens": tokens, "mask": mask, "record": rec, "expanded_len": expanded_len}
+    return {
+        "tokens": tokens,
+        "mask": mask,
+        "record": rec,
+        "image_values": images,
+        "image_count": image_count,
+        "expanded_len": expanded_len,
+    }
 
 
 def render_records(records, tokenizer, max_seq_len=2048):
@@ -220,7 +245,7 @@ def render_records(records, tokenizer, max_seq_len=2048):
         example = render_record(rec, tokenizer, max_seq_len=max_seq_len)
         if example is not None:
             rendered.append(example)
-    assert rendered, "no usable image-text examples loaded"
+    assert rendered, "no usable VLM/text examples loaded"
     return rendered
 
 
@@ -246,53 +271,151 @@ def split_train_val_examples(examples, val_examples=DEFAULT_VAL_EXAMPLES, use_va
     return examples[:-val_count], examples[-val_count:]
 
 
-def next_batch(examples, batch_size, cursor, rng, max_batch_tokens=0):
-    if cursor == 0:
-        rng.shuffle(examples)
-    batch = []
-    total_len = 0
-    while len(batch) < batch_size:
-        if cursor >= len(examples):
-            cursor = 0
-            rng.shuffle(examples)
-            if batch:
-                break
-        candidate = examples[cursor]
-        candidate_len = int(candidate["expanded_len"])
-        if batch and max_batch_tokens > 0 and total_len + candidate_len > max_batch_tokens:
-            break
-        batch.append(candidate)
-        total_len += candidate_len
-        cursor += 1
-        if cursor >= len(examples):
-            cursor = 0
-            break
-    return batch, cursor
+def validate_pack_args(args):
+    assert args.device_batch_size > 0, "--device-batch-size must be positive"
+    assert args.max_seq_len > 1, "--max-seq-len must be greater than 1"
+    assert args.max_batch_images >= 0, "--max-batch-images must be non-negative"
 
 
-def open_images(examples, image_root=None, image_zip=None, skip_bad_images=False):
+def candidate_buffer_size(batch_size):
+    return batch_size * PACK_CANDIDATE_MULTIPLIER
+
+
+def open_images_by_rows(rows, image_root=None, image_zip=None, skip_bad_images=False):
     images = []
-    kept = []
-    for i, example in enumerate(examples):
-        try:
-            images.append(open_image(example["record"], image_root=image_root, image_zip=image_zip))
-            kept.append(example)
-        except Exception as exc:
-            if not skip_bad_images:
-                raise
-            print0(f"skipping image {example['record'].get('id', i)}: {type(exc).__name__}: {exc}")
-    return images, kept
+    kept_rows = []
+    for row in rows:
+        kept = []
+        for i, example in enumerate(row):
+            try:
+                values = example.get("image_values")
+                if values is None:
+                    values = image_values(example["record"])
+                opened = [
+                    open_image_value(value, image_root=image_root, image_zip=image_zip)
+                    for value in values
+                ]
+                images.extend(opened)
+                kept.append(example)
+            except Exception as exc:
+                if not skip_bad_images:
+                    raise
+                print0(f"skipping image {example['record'].get('id', i)}: {type(exc).__name__}: {exc}")
+        kept_rows.append(kept)
+    return images, kept_rows
 
 
-def pack_examples(examples, image_features):
-    row = []
-    mask = []
+def example_image_count(example):
+    return int(example.get("image_count", count_image_tokens(example.get("tokens", []))))
+
+
+def choose_fixed_pack(examples, batch_size, max_seq_len, max_images=0):
+    """Best-fit decreasing pack into fixed rows; returns row groups and selected indices."""
+    rows = [{"examples": [], "length": 0} for _ in range(batch_size)]
+    selected = []
+    total_images = 0
+    candidates = [
+        (idx, example)
+        for idx, example in enumerate(examples)
+        if int(example["expanded_len"]) <= max_seq_len
+    ]
+    candidates.sort(key=lambda item: int(item[1]["expanded_len"]), reverse=True)
+    for idx, example in candidates:
+        candidate_len = int(example["expanded_len"])
+        candidate_images = example_image_count(example)
+        if max_images > 0 and total_images + candidate_images > max_images:
+            continue
+        best = None
+        for row_idx, row in enumerate(rows):
+            new_len = row["length"] + candidate_len
+            if new_len <= max_seq_len:
+                remaining = max_seq_len - new_len
+                if best is None or remaining < best[0]:
+                    best = (remaining, row_idx)
+        if best is None:
+            continue
+        row = rows[best[1]]
+        row["examples"].append(example)
+        row["length"] += candidate_len
+        total_images += candidate_images
+        selected.append(idx)
+    if not selected:
+        return None, []
+    return [row["examples"] for row in rows], selected
+
+
+def pop_fixed_pack(buffer, batch_size, max_seq_len, max_images=0):
+    row_examples, selected = choose_fixed_pack(buffer, batch_size, max_seq_len, max_images)
+    if not selected:
+        return None, buffer
+    selected_set = set(selected)
+    buffer = [example for idx, example in enumerate(buffer) if idx not in selected_set]
+    return row_examples, buffer
+
+
+def pad_fixed_row(row, mask, segment_lengths, expanded_len, max_seq_len, fallback_token_id):
+    remaining = max_seq_len - expanded_len
+    assert remaining >= 0, f"packed row length {expanded_len} exceeded max seq len {max_seq_len}"
+    if remaining == 0:
+        return
+    # A text-only dummy segment of N+1 tokens contributes exactly N shifted input
+    # positions. Its labels are fully ignored and its segment boundary prevents
+    # attention/smear leakage with real examples.
+    dummy_len = remaining + 1
+    row.extend([fallback_token_id] * dummy_len)
+    mask.extend([0] * dummy_len)
+    segment_lengths.append(dummy_len)
+
+
+def pack_fixed_rows(row_examples, image_features, max_seq_len, fallback_token_id=None):
+    flat_examples = [example for row in row_examples for example in row]
+    if fallback_token_id is None:
+        fallback_token_id = int(flat_examples[0]["tokens"][0]) if flat_examples else 1
+    rows = []
+    masks = []
+    image_counts = []
     segment_lengths = []
-    for example in examples:
-        row.extend(example["tokens"])
-        mask.extend(example["mask"])
-        segment_lengths.append(len(example["tokens"]))
-    return [row], [mask], image_features[:len(examples)], [len(examples)], [segment_lengths]
+    total_images = 0
+    for examples in row_examples:
+        row = []
+        mask = []
+        lengths = []
+        expanded_len = 0
+        row_images = 0
+        for example in examples:
+            row.extend(example["tokens"])
+            mask.extend(example["mask"])
+            lengths.append(len(example["tokens"]))
+            expanded_len += int(example["expanded_len"])
+            row_images += example_image_count(example)
+        pad_fixed_row(row, mask, lengths, expanded_len, max_seq_len, fallback_token_id)
+        rows.append(row)
+        masks.append(mask)
+        image_counts.append(row_images)
+        total_images += row_images
+        segment_lengths.append(lengths)
+    if image_features is not None:
+        image_features = image_features[:total_images]
+    else:
+        assert total_images == 0, f"packed rows need {total_images} images but no image features were provided"
+    return rows, masks, image_features, image_counts, segment_lengths
+
+
+def make_packed_batch(row_examples, processor, image_root=None, image_zip=None, skip_bad_images=True, max_seq_len=512):
+    images, kept_rows = open_images_by_rows(row_examples, image_root, image_zip, skip_bad_images)
+    pixel_values = processor(images=images, return_tensors="pt")["pixel_values"] if images else None
+    rows, masks, pixel_values, image_counts, segment_lengths = pack_fixed_rows(kept_rows, pixel_values, max_seq_len)
+    num_examples = sum(len(row) for row in kept_rows)
+    if num_examples == 0:
+        return None
+    return {
+        "rows": rows,
+        "masks": masks,
+        "pixel_values": pixel_values,
+        "image_counts": image_counts,
+        "segment_lengths": segment_lengths,
+        "num_examples": num_examples,
+    }
 
 
 class PackedVisionBatchDataset(Dataset):
@@ -306,6 +429,7 @@ class PackedVisionBatchDataset(Dataset):
         image_root=None,
         image_zip=None,
         skip_bad_images=True,
+        max_seq_len=512,
     ):
         self.batches = batches
         self.siglip_model_id = siglip_model_id
@@ -313,6 +437,7 @@ class PackedVisionBatchDataset(Dataset):
         self.image_root = image_root
         self.image_zip = image_zip
         self.skip_bad_images = skip_bad_images
+        self.max_seq_len = max_seq_len
         self.processor = None
 
     def __len__(self):
@@ -327,20 +452,14 @@ class PackedVisionBatchDataset(Dataset):
         return self.processor
 
     def __getitem__(self, idx):
-        examples = self.batches[idx]
-        images, kept = open_images(examples, self.image_root, self.image_zip, self.skip_bad_images)
-        if not images:
-            return None
-        pixel_values = self._processor()(images=images, return_tensors="pt")["pixel_values"]
-        rows, masks, pixel_values, image_counts, segment_lengths = pack_examples(kept, pixel_values)
-        return {
-            "rows": rows,
-            "masks": masks,
-            "pixel_values": pixel_values,
-            "image_counts": image_counts,
-            "segment_lengths": segment_lengths,
-            "num_examples": len(kept),
-        }
+        return make_packed_batch(
+            self.batches[idx],
+            self._processor(),
+            image_root=self.image_root,
+            image_zip=self.image_zip,
+            skip_bad_images=self.skip_bad_images,
+            max_seq_len=self.max_seq_len,
+        )
 
 
 class StreamingVisionBatchDataset(IterableDataset):
@@ -356,8 +475,9 @@ class StreamingVisionBatchDataset(IterableDataset):
     ):
         self.hf_repo = args.hf_repo or DEFAULT_HF_REPO
         self.batch_size = args.device_batch_size
-        self.max_batch_tokens = args.max_batch_tokens
         self.max_seq_len = args.max_seq_len
+        self.max_batch_images = args.max_batch_images
+        self.candidate_buffer_size = candidate_buffer_size(self.batch_size)
         self.siglip_model_id = args.siglip_model_id
         self.siglip_cache_dir = siglip_cache_dir
         self.image_root = args.image_root
@@ -382,20 +502,15 @@ class StreamingVisionBatchDataset(IterableDataset):
             ds = ds.skip(self.skip_records) if hasattr(ds, "skip") else itertools.islice(ds, self.skip_records, None)
         return itertools.islice(ds, worker_id, None, num_workers)
 
-    def _pack_batch(self, examples):
-        images, kept = open_images(examples, self.image_root, self.image_zip, self.skip_bad_images)
-        if not images:
-            return None
-        pixel_values = self._processor()(images=images, return_tensors="pt")["pixel_values"]
-        rows, masks, pixel_values, image_counts, segment_lengths = pack_examples(kept, pixel_values)
-        return {
-            "rows": rows,
-            "masks": masks,
-            "pixel_values": pixel_values,
-            "image_counts": image_counts,
-            "segment_lengths": segment_lengths,
-            "num_examples": len(kept),
-        }
+    def _pack_fixed_batch(self, row_examples):
+        return make_packed_batch(
+            row_examples,
+            self._processor(),
+            image_root=self.image_root,
+            image_zip=self.image_zip,
+            skip_bad_images=self.skip_bad_images,
+            max_seq_len=self.max_seq_len,
+        )
 
     def _batch_limit(self, num_workers):
         if self.max_batches is None:
@@ -408,69 +523,70 @@ class StreamingVisionBatchDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info else 1
         batch_limit = self._batch_limit(num_workers)
         yielded = 0
-        batch = []
-        total_len = 0
+        buffer = []
         for rec in self._record_stream(worker_id, num_workers):
             example = render_record(rec, self.tokenizer, max_seq_len=self.max_seq_len)
             if example is None:
                 continue
-            candidate_len = int(example["expanded_len"])
-            if batch and self.max_batch_tokens > 0 and total_len + candidate_len > self.max_batch_tokens:
-                packed = self._pack_batch(batch)
-                if packed is not None:
-                    yield packed
-                    yielded += 1
-                    if batch_limit is not None and yielded >= batch_limit:
-                        return
-                batch = []
-                total_len = 0
-            batch.append(example)
-            total_len += candidate_len
-            if len(batch) >= self.batch_size:
-                packed = self._pack_batch(batch)
-                if packed is not None:
-                    yield packed
-                    yielded += 1
-                    if batch_limit is not None and yielded >= batch_limit:
-                        return
-                batch = []
-                total_len = 0
-        if batch:
-            packed = self._pack_batch(batch)
+            buffer.append(example)
+            if len(buffer) < self.candidate_buffer_size:
+                continue
+            row_examples, buffer = pop_fixed_pack(buffer, self.batch_size, self.max_seq_len, self.max_batch_images)
+            if row_examples is None:
+                buffer = []
+                continue
+            packed = self._pack_fixed_batch(row_examples)
             if packed is not None:
                 yield packed
+                yielded += 1
+                if batch_limit is not None and yielded >= batch_limit:
+                    return
+        while buffer:
+            row_examples, buffer = pop_fixed_pack(buffer, self.batch_size, self.max_seq_len, self.max_batch_images)
+            if row_examples is None:
+                break
+            packed = self._pack_fixed_batch(row_examples)
+            if packed is not None:
+                yield packed
+                yielded += 1
+                if batch_limit is not None and yielded >= batch_limit:
+                    return
 
 
-def build_training_batches(examples, num_batches, batch_size, max_batch_tokens, seed):
+def build_training_batches(examples, num_batches, batch_size, max_seq_len, max_images, seed):
     examples = list(examples)
     rng = random.Random(seed)
     cursor = 0
+    buffer = []
     batches = []
+    buffer_size = candidate_buffer_size(batch_size)
     for _ in range(num_batches):
-        batch, cursor = next_batch(examples, batch_size, cursor, rng, max_batch_tokens=max_batch_tokens)
+        while len(buffer) < buffer_size:
+            if cursor == 0:
+                rng.shuffle(examples)
+            buffer.append(examples[cursor])
+            cursor += 1
+            if cursor >= len(examples):
+                cursor = 0
+                break
+        batch, buffer = pop_fixed_pack(buffer, batch_size, max_seq_len, max_images)
         if not batch:
             raise RuntimeError("could not build a non-empty VLM microbatch")
         batches.append(batch)
     return batches
 
 
-def num_packed_batches(examples, batch_size, max_batch_tokens):
+def num_packed_batches(examples, batch_size, max_seq_len, max_images=0):
     if not examples:
         return 0
+    remaining = [example for example in examples if int(example["expanded_len"]) <= max_seq_len]
     count = 0
-    batch_count = 0
-    total_len = 0
-    for example in examples:
-        candidate_len = int(example["expanded_len"])
-        if batch_count and (
-            batch_count >= batch_size or (max_batch_tokens > 0 and total_len + candidate_len > max_batch_tokens)
-        ):
-            count += 1
-            batch_count = 0
-            total_len = 0
-        batch_count += 1
-        total_len += candidate_len
-    return count + int(batch_count > 0)
+    while remaining:
+        batch, remaining = pop_fixed_pack(remaining, batch_size, max_seq_len, max_images)
+        if batch is None:
+            break
+        count += 1
+    return count
 
 
 def build_batch_loader(args, tokenizer, siglip_cache_dir, device_type, num_batches=None, seed=0, examples=None, skip_records=0):
@@ -500,7 +616,8 @@ def build_batch_loader(args, tokenizer, siglip_cache_dir, device_type, num_batch
             examples,
             num_batches=num_batches,
             batch_size=args.device_batch_size,
-            max_batch_tokens=args.max_batch_tokens,
+            max_seq_len=args.max_seq_len,
+            max_images=args.max_batch_images,
             seed=seed,
         )
         dataset = PackedVisionBatchDataset(
@@ -510,12 +627,18 @@ def build_batch_loader(args, tokenizer, siglip_cache_dir, device_type, num_batch
             image_root=args.image_root,
             image_zip=args.image_zip,
             skip_bad_images=args.skip_bad_images,
+            max_seq_len=args.max_seq_len,
         )
     return DataLoader(dataset, **kwargs)
 
 
 def compute_vlm_loss(model, projector, extractor, packed):
-    feats = extractor.encode_pixel_values(packed["pixel_values"])
+    pixel_values = packed["pixel_values"]
+    if pixel_values is None:
+        device = next(projector.parameters()).device
+        feats = torch.empty((0, VISION_TOKENS, projector.vision_dim), device=device)
+    else:
+        feats = extractor.encode_pixel_values(pixel_values)
     rows = packed["rows"]
     batch = build_multimodal_batch(
         model,
@@ -656,9 +779,9 @@ def main():
     parser.add_argument("--model-tag", default="d32")
     parser.add_argument("--model-step", type=int, default=650)
     parser.add_argument("--device-type", default="", choices=["", "cuda", "cpu", "mps"])
-    parser.add_argument("--device-batch-size", type=int, default=128)
-    parser.add_argument("--max-batch-tokens", type=int, default=12000)
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--device-batch-size", type=int, default=32, help="fixed packed rows per microbatch")
+    parser.add_argument("--max-seq-len", type=int, default=512, help="expanded decoder tokens per packed row")
+    parser.add_argument("--max-batch-images", type=int, default=96, help="maximum real images per microbatch; 0 disables the cap")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-iterations", type=int, default=1000)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -674,6 +797,7 @@ def main():
     parser.add_argument("--require-fa3-varlen", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    validate_pack_args(args)
 
     if args.require_fa3_varlen:
         require_fa3_varlen()
@@ -770,7 +894,12 @@ def main():
     batch_iter = iter(batch_loader)
     val_loader = None
     if val_examples:
-        eval_batches = num_packed_batches(val_examples, args.device_batch_size, args.max_batch_tokens)
+        eval_batches = num_packed_batches(
+            val_examples,
+            args.device_batch_size,
+            args.max_seq_len,
+            args.max_batch_images,
+        )
         val_loader = build_batch_loader(
             args,
             tokenizer,
@@ -792,6 +921,11 @@ def main():
     total_params = count_params(model.parameters()) + count_params(projector.parameters())
     total_trainable = count_params(p for p in list(model.parameters()) + list(projector.parameters()) if p.requires_grad)
     print0(f"VLM | GPU: {gpu_name} | train: {train_desc} | val: {len(val_examples):,} | data: {data_path} | out: {out_dir}")
+    print0(
+        f"Pack shape: {args.device_batch_size} x {args.max_seq_len} "
+        f"(candidate buffer {candidate_buffer_size(args.device_batch_size)}, "
+        f"max images {args.max_batch_images or 'unlimited'})"
+    )
     print0(f"Params total/trainable: {total_params:,}/{total_trainable:,}")
     print0(f"FLOPs/token: {flops_per_token:e} | Peak BF16 FLOPS: {gpu_peak_flops:.2e}")
     if device_type == "cuda":
@@ -820,7 +954,7 @@ def main():
             target_tokens_this_step += target_count
             samples_this_step += sample_count
         if train_loss is None:
-            raise RuntimeError("no usable images loaded for this optimizer step")
+            raise RuntimeError("no usable examples loaded for this optimizer step")
 
         lrm = get_lr_multiplier(step, args.num_iterations, 0.0, WARMDOWN_RATIO, 0.0)
         apply_llm_schedule(llm_optimizer, lrm, step)

@@ -7,10 +7,10 @@ You are running training for nanochat-llava on a single GPU Vast.ai box.
 
 Repo/commit:
 - Work in the nanochat-llava repo.
-- Use commit c6e7cf3 or newer.
+- Use the current repo checkout; do not assume older pre-FineVision args.
 - Do not add FP8, activation checkpointing, cached image features, profiling code, or framework-style config.
 - Keep the code simple and nanochat-style.
-- Use the default FineVisionMax stream; do not add local streaming shuffle or data caps.
+- Use the default `HuggingFaceM4/FineVisionMax` stream. Do not add local streaming shuffle, data caps, feature caches, or resume/offset machinery unless asked.
 
 Setup:
 1. Run:
@@ -24,7 +24,16 @@ Setup:
    mkdir -p "$NANOCHAT_BASE_DIR" "$HF_HOME" "$NANOCHAT_SIGLIP_CACHE_DIR"
 
 3. Verify:
-   uv run python -m pytest tests/test_vision.py -q
+   uv run python -m pytest tests/test_vision.py tests/test_vlm_smoke.py -q
+
+4. Check whether this box has FA3 varlen. H100/H200 should; A100 usually will not:
+   uv run --extra vision --extra gpu python -c "from nanochat.flash_attention import has_fa3_varlen; print('FA3_VARLEN', has_fa3_varlen())"
+
+   If it prints `True`, use:
+   export FA3_ARG=--require-fa3-varlen
+
+   If it prints `False`, use:
+   export FA3_ARG=
 
 First smoke:
 Run 2 steps and confirm train loss, val loss, and checkpoint save work:
@@ -36,12 +45,13 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --device-type cuda \
   --num-iterations 2 \
   --device-batch-size 8 \
-  --max-batch-tokens 2000 \
+  --max-seq-len 512 \
+  --max-batch-images 16 \
   --eval-every 1 \
   --val-examples 8 \
   --save-every 2 \
   --model-step 650 \
-  --require-fa3-varlen
+  $FA3_ARG
 
 Then run tiny eval:
 
@@ -62,18 +72,24 @@ uv run --extra vision --extra gpu python -m scripts.vlm_train \
   --out-dir "$DATA_ROOT/checkpoints/vlm" \
   --device-type cuda \
   --num-iterations 1000 \
-  --device-batch-size 768 \
-  --max-batch-tokens 14000 \
+  --device-batch-size 32 \
+  --max-seq-len 512 \
+  --max-batch-images 96 \
   --num-workers 4 \
   --eval-every 200 \
   --val-examples 2048 \
   --save-every 1000 \
   --model-step 650 \
-  --require-fa3-varlen
+  $FA3_ARG
+
+Notes:
+- `--device-batch-size 32 --max-seq-len 512` is the actual fixed tensor shape: 32 packed rows by 512 expanded decoder tokens.
+- The trainer best-fit packs text-only, single-image, and multi-image examples from an internal 24x candidate buffer, caps real images with `--max-batch-images`, and pads row tails with ignored dummy segments. Varlen boundaries keep examples from attending across packed boundaries.
+- Modal H100 double-check on 2026-05-27: mixed-modality fixed `32 x 512` packing completed 6 steps with warm steps at `28.31-30.73%` BF16 MFU and `72866.35MiB` peak memory.
 
 If OOM:
-- First reduce --max-batch-tokens to 12000.
-- Then reduce --device-batch-size.
+- First reduce to `--device-batch-size 24 --max-seq-len 512`.
+- Then reduce `--max-seq-len` to 384 if needed.
 - Do not add activation checkpointing or feature caching.
 
 After training:

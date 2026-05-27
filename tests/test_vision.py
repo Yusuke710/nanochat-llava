@@ -37,14 +37,19 @@ from scripts.vlm_eval import (
     parse_inline_options,
 )
 from scripts.vlm_train import (
+    build_training_batches,
+    choose_fixed_pack,
     collect_rendered_examples,
+    compute_vlm_loss,
     evaluate_vlm_loss,
     get_lr_multiplier,
-    next_batch,
+    image_values,
     num_packed_batches,
     open_image,
     _open_hf_record_stream,
-    open_images,
+    open_images_by_rows,
+    pack_fixed_rows,
+    render_record,
     render_records,
     save_training_checkpoint,
     split_train_val_examples,
@@ -240,6 +245,102 @@ def test_boundary_aware_varlen_packed_loss_matches_separate_examples():
     torch.testing.assert_close(packed_loss, separate_loss, rtol=1e-5, atol=1e-5)
 
 
+def test_fixed_pack_rows_pad_with_ignored_boundary_segments():
+    model, projector = tiny_model()
+    examples = [
+        {"tokens": [1, IMAGE_TOKEN_ID, 10, 11], "mask": [0, 0, 1, 1], "expanded_len": VISION_TOKENS + 2, "record": {"id": i}}
+        for i in range(2)
+    ]
+    row_examples, selected = choose_fixed_pack(examples, 2, 80)
+    assert sorted(selected) == [0, 1]
+    features = torch.randn(2, VISION_TOKENS, 8)
+    rows, masks, image_counts, segment_lengths = None, None, None, None
+    rows, masks, features, image_counts, segment_lengths = pack_fixed_rows(row_examples, features, max_seq_len=80)
+    assert len(rows) == 2
+    assert image_counts == [1, 1]
+    assert all(lengths[-1] == 15 for lengths in segment_lengths)  # 14 dummy shifted positions + 1 target token
+
+    batch = build_multimodal_batch(
+        model,
+        projector,
+        rows,
+        features,
+        loss_mask_rows=masks,
+        image_counts_per_row=image_counts,
+        segment_token_lengths_per_row=segment_lengths,
+        value_fallback_token_id=1,
+    )
+    assert batch.value_token_ids.shape == (2, 80)
+    assert int(batch.cu_seqlens[-1]) == 160
+    assert int(batch.lengths.sum()) == 160
+    assert int(batch.loss_targets.numel()) == 2
+
+
+def test_mixed_text_and_multi_image_rows_share_one_batch():
+    model, projector = tiny_model()
+    text = {
+        "tokens": [1, 10, 11, 12],
+        "mask": [0, 1, 1, 1],
+        "expanded_len": 3,
+        "image_values": [],
+        "image_count": 0,
+        "record": {"id": "text"},
+    }
+    multi = {
+        "tokens": [1, IMAGE_TOKEN_ID, 20, IMAGE_TOKEN_ID, 21, 22],
+        "mask": [0, 0, 1, 0, 1, 1],
+        "expanded_len": 5 + 2 * (VISION_TOKENS - 1),
+        "image_values": ["a.jpg", "b.jpg"],
+        "image_count": 2,
+        "record": {"id": "multi"},
+    }
+    rows, masks, features, image_counts, segment_lengths = pack_fixed_rows(
+        [[text, multi], []],
+        torch.randn(2, VISION_TOKENS, 8),
+        max_seq_len=192,
+    )
+    assert image_counts == [2, 0]
+    assert features.shape == (2, VISION_TOKENS, 8)
+
+    batch = build_multimodal_batch(
+        model,
+        projector,
+        rows,
+        features,
+        loss_mask_rows=masks,
+        image_counts_per_row=image_counts,
+        segment_token_lengths_per_row=segment_lengths,
+        value_fallback_token_id=1,
+    )
+    assert batch.value_token_ids.shape == (2, 192)
+    assert int(batch.cu_seqlens[-1]) == 384
+    assert int(batch.loss_targets.numel()) >= 3
+
+
+def test_text_only_batch_skips_siglip():
+    model, projector = tiny_model()
+    packed = {
+        "rows": [[1, 10, 11, 12]],
+        "masks": [[0, 1, 1, 1]],
+        "pixel_values": None,
+        "image_counts": [0],
+        "segment_lengths": [[4]],
+        "num_examples": 1,
+    }
+
+    class Extractor:
+        vision_dim = 8
+
+        def encode_pixel_values(self, pixel_values):  # pragma: no cover - must not be called
+            raise AssertionError("text-only batches should not run SigLIP")
+
+    loss, token_count, target_count, sample_count = compute_vlm_loss(model, projector, Extractor(), packed)
+    assert torch.isfinite(loss)
+    assert token_count == 3
+    assert target_count == 3
+    assert sample_count == 1
+
+
 def test_text_only_gpt_path_and_embed_hook_match():
     model, _ = tiny_model()
     row = [1, 10, 11, 12, 13]
@@ -312,15 +413,53 @@ def test_training_rendering_filters_bad_rows_and_counts_targets():
         )
 
 
-def test_next_batch_respects_padded_token_budget():
+def test_render_record_supports_text_only_and_multi_image():
+    tokenizer = TinyTokenizer()
+    text_only = render_record(
+        {"messages": [{"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4"}]},
+        tokenizer,
+        max_seq_len=128,
+    )
+    assert text_only is not None
+    assert text_only["image_count"] == 0
+    assert count_image_tokens(text_only["tokens"]) == 0
+
+    multi = render_record(
+        {
+            "images": ["a.jpg", "b.jpg"],
+            "messages": [{"role": "user", "content": "Compare them."}, {"role": "assistant", "content": "The second is brighter."}],
+        },
+        tokenizer,
+        max_seq_len=256,
+    )
+    assert multi is not None
+    assert multi["image_count"] == 2
+    assert image_values(multi["record"]) == ["a.jpg", "b.jpg"]
+    assert count_image_tokens(multi["tokens"]) == 2
+
+    mismatched = render_record(
+        {
+            "images": ["a.jpg", "b.jpg"],
+            "messages": [{"role": "user", "content": f"{IMAGE_MARKER}\nCompare."}, {"role": "assistant", "content": "A."}],
+        },
+        tokenizer,
+        max_seq_len=256,
+    )
+    assert mismatched is None
+
+
+def test_build_training_batches_uses_fixed_shape_best_fit():
     examples = [
-        {"expanded_len": 100, "tokens": [1, IMAGE_TOKEN_ID, 2], "mask": [0, 0, 1], "record": {"image": "a"}},
-        {"expanded_len": 80, "tokens": [1, IMAGE_TOKEN_ID, 3], "mask": [0, 0, 1], "record": {"image": "b"}},
+        {"expanded_len": 70, "tokens": [1, IMAGE_TOKEN_ID, 2], "mask": [0, 0, 1], "record": {"image": "a"}},
+        {"expanded_len": 70, "tokens": [1, IMAGE_TOKEN_ID, 3], "mask": [0, 0, 1], "record": {"image": "b"}},
         {"expanded_len": 20, "tokens": [1, IMAGE_TOKEN_ID, 4], "mask": [0, 0, 1], "record": {"image": "c"}},
+        {"expanded_len": 20, "tokens": [1, IMAGE_TOKEN_ID, 5], "mask": [0, 0, 1], "record": {"image": "d"}},
     ]
-    batch, cursor = next_batch(examples, batch_size=3, cursor=0, rng=__import__("random").Random(0), max_batch_tokens=180)
-    assert len(batch) <= 2
-    assert cursor > 0
+    batches = build_training_batches(examples, num_batches=1, batch_size=2, max_seq_len=100, max_images=0, seed=0)
+    assert len(batches) == 1
+    assert len(batches[0]) == 2
+    assert all(sum(example["expanded_len"] for example in row) <= 100 for row in batches[0])
+    assert sorted(sum(example["expanded_len"] for example in row) for row in batches[0]) == [90, 90]
 
 
 def test_split_train_val_examples_is_small_and_optional():
@@ -335,11 +474,10 @@ def test_split_train_val_examples_is_small_and_optional():
     assert val == []
 
 
-def test_num_packed_batches_uses_token_budget():
-    examples = [{"expanded_len": n} for n in (60, 50, 80, 20)]
-    assert num_packed_batches([], batch_size=2, max_batch_tokens=100) == 0
-    assert num_packed_batches(examples, batch_size=2, max_batch_tokens=100) == 3
-    assert num_packed_batches(examples, batch_size=2, max_batch_tokens=0) == 2
+def test_num_packed_batches_uses_fixed_shape():
+    examples = [{"expanded_len": n} for n in (60, 50, 80, 20, 120)]
+    assert num_packed_batches([], batch_size=2, max_seq_len=100) == 0
+    assert num_packed_batches(examples, batch_size=2, max_seq_len=100) == 2
 
 
 def test_evaluate_vlm_loss_restores_train_mode():
@@ -432,12 +570,12 @@ def test_image_zip_and_finevision_loading(tmp_path):
     assert from_bytes.size == (2, 2)
 
 
-def test_open_images_can_skip_dead_images(tmp_path):
+def test_open_images_by_rows_can_skip_dead_images(tmp_path):
     Image.new("RGB", (4, 4), color=(1, 2, 3)).save(tmp_path / "ok.jpg")
     examples = [{"record": {"image": "ok.jpg"}}, {"record": {"image": "missing.jpg"}}]
 
-    images, kept = open_images(examples, tmp_path, skip_bad_images=True)
-    assert len(kept) == 1
+    images, kept_rows = open_images_by_rows([[examples[0]], [examples[1]]], tmp_path, skip_bad_images=True)
+    assert kept_rows == [[examples[0]], []]
     assert len(images) == 1
     assert images[0].size == (4, 4)
 
@@ -494,9 +632,15 @@ def test_lr_schedule_and_modal_command_builders():
     train_cmd = modal_vlm.build_train_cmd(no_save=True, require_fa3_varlen=True)
     assert train_cmd[:3] == ["python", "-m", "scripts.vlm_train"]
     assert train_cmd[train_cmd.index("--hf-repo") + 1] == "HuggingFaceM4/FineVisionMax"
+    assert train_cmd[train_cmd.index("--device-batch-size") + 1] == "32"
+    assert train_cmd[train_cmd.index("--max-seq-len") + 1] == "512"
+    assert train_cmd[train_cmd.index("--max-batch-images") + 1] == "96"
     assert "--hf-config" not in train_cmd
     assert "--require-fa3-varlen" in train_cmd
     assert "--no-save" in train_cmd
+    assert "--max-batch-tokens" not in train_cmd
+    assert "--pack-batch-size" not in train_cmd
+    assert "--pack-seq-len" not in train_cmd
     assert "--max-" + "examples" not in train_cmd
     assert "--eval-tokens" not in train_cmd
     assert "--eval-steps" not in train_cmd

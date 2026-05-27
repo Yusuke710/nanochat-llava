@@ -9,7 +9,7 @@ were intentionally removed to keep the implementation minimal.
 - `nanochat/vision.py`: `<image>` marker handling, frozen SigLIP base patch-16/512, nanoVLM-style 8x8 pixel-shuffle pooling to 64 visual tokens, linear projector, vectorized visual-token insertion, target masking, generation helper, VLM checkpoint helpers, and HF nanochat-d32 linking.
 - `nanochat/gpt.py`: thin optional `input_embeds` / `value_token_ids` / varlen-boundary / target-index hooks in `GPT.forward`; ordinary text-only `model(idx, targets)` behavior is preserved.
 - `nanochat/checkpoint_manager.py`: compatibility patching for old `karpathy/nanochat-d32` checkpoint keys missing from the current GPT module.
-- `scripts/vlm_train.py`: one visual-instruction trainer. It starts from `karpathy/nanochat-d32`, freezes SigLIP, trains the linear projector plus nanochat, packs many image-text examples into one compact row, and enforces boundaries with varlen FlashAttention. It supports JSON/HF rows and keeps SigLIP inline in the training step.
+- `scripts/vlm_train.py`: one visual-instruction trainer. It starts from `karpathy/nanochat-d32`, freezes SigLIP, trains the linear projector plus nanochat, and uses a fixed nanochat-style packed shape controlled by `--device-batch-size` and `--max-seq-len`. It supports mixed text-only, single-image, and multi-image JSON/HF rows with `--max-batch-images`, and keeps SigLIP inline in the training step.
 - `scripts/vlm_eval.py`: verifier subset runner for MMStar, ScienceQA, ChartQA, MMMU, and TextVQA. It exposes `evaluate_vlm(...)` for training-time checks, and the CLI evaluates one checkpoint, stores scores and sample generations, and leaves checkpoint-to-checkpoint comparisons outside the script.
 - `tests/test_vision.py` and `tests/test_vlm_smoke.py`: focused unit tests plus synthetic image-conditioned overfit/control smoke. The smoke now lives in tests, not scripts.
 - `modal_vlm.py`: minimal Modal wrapper with `doctor`, `smoke`, `train`, and `eval` only. Default GPU is `A100-80GB`; set `NANOCHAT_MODAL_GPU=H100` to switch.
@@ -21,7 +21,7 @@ were intentionally removed to keep the implementation minimal.
 - Keep inline SigLIP for v0 so the main path reflects real training.
 - Do not judge success from aggregate benchmark numbers alone. Compare separate checkpoint eval JSONs and inspect stored sample generations.
 - The old Stage 1/Stage 2 split lives only in the experiment branch. Main uses one visual-instruction path.
-- Follow nanochat's eval shape: training-time loss eval is token-budgeted, not example-counted. Main uses `--eval-tokens 524288` over a held-out VLM pool. Standalone VLM benchmark eval is separate and defaults to 24 examples per benchmark, matching nanochat's small generative ChatCORE cap.
+- Keep training-time loss eval cheap and separate from standalone benchmark eval. Main packs a small held-out VLM pool through the same fixed training shape; `vlm_eval.py` remains the heavier MMStar/ScienceQA/ChartQA/MMMU/TextVQA verifier.
 
 ## Current commands
 
@@ -41,9 +41,10 @@ uv run --extra vision modal run modal_vlm.py::smoke
 
 NANOCHAT_MODAL_GPU=H100 uv run --extra vision modal run modal_vlm.py::train \
   --num-iterations 6 \
-  --batch-size 768 \
-  --max-batch-tokens 18000 \
-  --max-examples 1024 \
+  --batch-size 32 \
+  --max-seq-len 512 \
+  --max-batch-images 96 \
+  --eval-every -1 \
   --no-save \
   --log-every 1
 
@@ -124,7 +125,6 @@ python -m scripts.vlm_train \
   --num-iterations 250 \
   --device-batch-size 200 \
   --max-batch-tokens 16000 \
-  --max-examples 16000 \
   --max-seq-len 2048 \
   --save-every 250 \
   --model-step 650 \
@@ -186,7 +186,6 @@ python -m scripts.vlm_train \
   --num-iterations 100 \
   --device-batch-size 64 \
   --max-batch-tokens 12000 \
-  --max-examples 4096 \
   --max-seq-len 2048 \
   --save-every 100 \
   --model-step 650 \
@@ -303,14 +302,14 @@ frozen SigLIP, projector, nanochat training, and strict varlen FlashAttention
 boundaries. The SigLIP batch/chunk knob, VLM FP8 experiments, profile timers,
 and MFU grid machinery were removed from the main training script.
 
-Short Modal H100 checks on `HuggingFaceM4/the_cauldron/vqav2`:
+Short Modal H100 checks on the then-current streamed VLM dataset:
 
 ```text
-max_batch_tokens=12000, max_examples=512, steps=4
+max_batch_tokens=12000, steps=4
 step 00004/00004 | loss 1.530354 | samples/sec 14.82 | tokens/sec 2444 | bf16_mfu 2.99
 Peak memory usage: 64526.58MiB
 
-max_batch_tokens=16000, max_examples=768, steps=6
+max_batch_tokens=16000, steps=6
 step 00002/00006 | loss 1.578618 | samples/sec 15.38 | tokens/sec 2456 | bf16_mfu 3.00
 step 00003/00006 | loss 1.544003 | samples/sec 15.50 | tokens/sec 2454 | bf16_mfu 3.00
 step 00004/00006 | loss 1.487748 | samples/sec 15.17 | tokens/sec 2384 | bf16_mfu 2.91
@@ -366,7 +365,7 @@ Modal H100 follow-up on the simplified main branch:
 
 ```text
 target-only CE + vectorized multimodal construction + inline SigLIP
-max_batch_tokens=18000, max_examples=1024, steps=6
+max_batch_tokens=18000, steps=6
 step 00002/00006 | tokens/sec 6989 | bf16_mfu 8.03
 step 00003/00006 | tokens/sec 7228 | bf16_mfu 8.30
 step 00004/00006 | tokens/sec 7733 | bf16_mfu 8.89
@@ -375,7 +374,7 @@ step 00006/00006 | tokens/sec 6956 | bf16_mfu 7.99
 Peak memory usage: 69524.90MiB
 
 target-only CE + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
-max_batch_tokens=18000, max_examples=1024, steps=6, num_workers=4
+max_batch_tokens=18000, steps=6, num_workers=4
 step 00001/00006 | tokens/sec 560 | bf16_mfu 0.64
 step 00002/00006 | tokens/sec 21475 | bf16_mfu 24.67
 step 00003/00006 | tokens/sec 20912 | bf16_mfu 24.03
@@ -385,13 +384,13 @@ step 00006/00006 | tokens/sec 23870 | bf16_mfu 27.41
 Peak memory usage: 69524.90MiB
 
 target-only CE + diagnostic precomputed features, but naive per-token/per-image batch construction
-max_batch_tokens=20000, max_examples=1024, steps=6
+max_batch_tokens=20000, steps=6
 step 00002/00006 | tokens/sec 3705 | bf16_mfu 5.04
 step 00006/00006 | tokens/sec 3635 | bf16_mfu 4.95
 Peak memory usage: 74301.75MiB
 
 target-only CE + diagnostic precomputed features + vectorized multimodal construction
-max_batch_tokens=20000, max_examples=1024, steps=6
+max_batch_tokens=20000, steps=6
 step 00002/00006 | tokens/sec 23723 | bf16_mfu 27.25
 step 00003/00006 | tokens/sec 21629 | bf16_mfu 24.85
 step 00004/00006 | tokens/sec 23708 | bf16_mfu 27.24
@@ -399,13 +398,65 @@ step 00005/00006 | tokens/sec 25121 | bf16_mfu 28.86
 Result: OOM on step 6 near the 80GB memory edge.
 
 target-only CE + diagnostic precomputed features + vectorized multimodal construction
-max_batch_tokens=18000, max_examples=1024, steps=6
+max_batch_tokens=18000, steps=6
 step 00002/00006 | tokens/sec 21642 | bf16_mfu 24.86
 step 00003/00006 | tokens/sec 21222 | bf16_mfu 24.38
 step 00004/00006 | tokens/sec 22730 | bf16_mfu 26.12
 step 00005/00006 | tokens/sec 22248 | bf16_mfu 25.56
 step 00006/00006 | tokens/sec 22061 | bf16_mfu 25.34
 Peak memory usage: 69211.61MiB
+```
+
+Modal H100 double-check on current checkout, 2026-05-27:
+
+```text
+FineVisionMax streaming data shape, first 10,000 train rows:
+usable single-image rendered rows: 6,188; skipped non-single-image/no-image rows: 3,812
+all_text_words: mean 199.9, median 108, p90 407, p95 530, p99 1485, max 14739
+all_text_nanochat_tokens: mean 418.2, median 183, p90 986, p95 1620, p99 3207, max 22992
+assistant_nanochat_tokens: mean 316.0, median 135, p90 827, p95 1365, p99 2576, max 6678
+rendered_conversation_tokens_with_specials: mean 436.7, median 194, p90 1014, p95 1659, p99 3278, max 25024
+expanded_decoder_input_len_with_64_image_tokens: mean 498.7, median 256, p90 1076, p95 1721, p99 3340, max 25086
+
+target-only CE + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+batch_size=768, max_batch_tokens=18000, steps=6, num_workers=4
+step 00002/00006 | tokens/sec 24279 | bf16_mfu 28.84
+Result: OOM on step 3 during backward. Memory at failure: 77.46GiB in use, 1.71GiB free.
+
+target-only CE + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+batch_size=768, max_batch_tokens=16000, steps=6, num_workers=4
+step 00001/00006 | tokens/sec 386 | bf16_mfu 0.46
+step 00002/00006 | tokens/sec 22392 | bf16_mfu 26.63
+step 00003/00006 | tokens/sec 22402 | bf16_mfu 26.86
+step 00004/00006 | tokens/sec 23191 | bf16_mfu 27.67
+step 00005/00006 | tokens/sec 23640 | bf16_mfu 28.18
+step 00006/00006 | tokens/sec 24112 | bf16_mfu 28.74
+Peak memory usage: 73007.99MiB
+
+target-only CE + fixed packed rows + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+batch_size=32, max_seq_len=512, internal candidate buffer=768, steps=6, num_workers=4
+step 00001/00006 | samples/sec 0.47 | tokens/sec 242 | target_tokens 11,027 | bf16_mfu 0.29
+step 00002/00006 | samples/sec 47.73 | tokens/sec 24440 | target_tokens 10,034 | bf16_mfu 29.08
+step 00003/00006 | samples/sec 48.93 | tokens/sec 25054 | target_tokens 10,827 | bf16_mfu 29.91
+step 00004/00006 | samples/sec 49.18 | tokens/sec 25181 | target_tokens 10,714 | bf16_mfu 30.05
+step 00005/00006 | samples/sec 64.70 | tokens/sec 24094 | target_tokens 9,725 | bf16_mfu 28.63
+step 00006/00006 | samples/sec 79.52 | tokens/sec 24128 | target_tokens 9,176 | bf16_mfu 28.61
+Peak memory usage: 73845.14MiB
+
+target-only CE + fixed packed rows + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+batch_size=64, max_seq_len=512, internal candidate buffer=1536, steps=6, num_workers=4
+Model/logged setup: `karpathy/nanochat-d32` config is 32 layers, 2048 hidden, 65,536 vocab; params total/trainable: 4,051,700,826 / 1,904,214,106.
+Result: OOM before finishing step 1. Memory at failure: 78.82GiB in use, 356.25MiB free. Failure allocation was a 512MiB MLP activation allocation.
+
+target-only CE + mixed text/single-image/multi-image fixed packed rows + vectorized multimodal construction + DataLoader-worker image preprocessing + inline SigLIP
+batch_size=32, max_seq_len=512, max_batch_images=96, internal candidate buffer=768, steps=6, num_workers=4
+step 00001/00006 | samples/sec 0.75 | tokens/sec 301 | target_tokens 9,351 | bf16_mfu 0.36
+step 00002/00006 | samples/sec 56.22 | tokens/sec 25587 | target_tokens 8,621 | bf16_mfu 30.26
+step 00003/00006 | samples/sec 59.81 | tokens/sec 25788 | target_tokens 8,063 | bf16_mfu 30.43
+step 00004/00006 | samples/sec 48.77 | tokens/sec 24213 | target_tokens 9,212 | bf16_mfu 28.71
+step 00005/00006 | samples/sec 74.12 | tokens/sec 23812 | target_tokens 9,860 | bf16_mfu 28.31
+step 00006/00006 | samples/sec 64.94 | tokens/sec 25949 | target_tokens 8,873 | bf16_mfu 30.73
+Peak memory usage: 72866.35MiB
 ```
 
 Interpretation:
@@ -420,6 +471,13 @@ Interpretation:
   the same realistic inline-SigLIP path to about `24-28%` MFU after the first
   worker warmup step. This matches nanoVLM/InternVL's simple pattern: workers
   return pinned CPU `pixel_values`, and the main process runs H2D plus SigLIP.
+  The current stable H100 default is the fixed `--device-batch-size 32
+  --max-seq-len 512 --max-batch-images 96` shape; after mixed text/multi-image
+  support it ran at `28.31-30.73%` BF16 MFU. Doubling to `64 x 512` OOMed
+  before step 1 on the current d32 model. The older compact
+  `max_batch_tokens=16000` path was removed from live code after this
+  comparison; it was slightly slower at `26.63-28.74%`, while `18000` was close
+  enough to the 80GB edge to OOM on later random batch shapes.
 - The train script now keeps benchmark/generation eval separate from cheap
   validation loss. `vlm_train.py` can run target-token validation CE every
   `--eval-every` steps over a small held-out visual-instruction split using the
@@ -429,8 +487,124 @@ Interpretation:
   that path to the experiment branch regime: roughly `24-26%` steady at an 18K
   token cap, with the 20K cap reaching `25-29%` before OOM.
 - The remaining gap to text-only nanochat is still the old one: the 80GB VLM path
-  fits about 18-20K packed tokens with this model and no checkpointing, not the
-  much larger per-rank text batch used in the nanochat speedrun. With inline
-  SigLIP, there is also real vision-encoder time inside every optimizer step.
+  fits about 16K packed-row tokens reliably with this model and no checkpointing,
+  not the much larger per-rank text batch used in the nanochat speedrun. With
+  inline SigLIP, there is also real vision-encoder time inside every optimizer
+  step.
 - The diagnostic precomputed-feature shortcut was useful for attribution but is
   not part of main because real v0 training keeps SigLIP inline.
+
+## Vast.ai A100 80GB run and benchmark drift, 2026-05-26
+
+Repo state: `0de2303aa6a22468624f6e59a5a39676365aabe1`
+(`Add Vast.ai Codex training prompt`), run on a single A100 80GB Vast.ai box.
+The A100 run could not use `--require-fa3-varlen`: the repo reports
+`HAS_FA3=False`, `USE_FA3=False`, and `has_fa3_varlen=False` because the FA3
+path is Hopper/SM90-only. Training below used the SDPA varlen fallback with the
+same batch/token settings otherwise. After installing the dev group,
+`uv run python -m pytest tests/test_vision.py -q` passed with `22 passed`.
+
+Data setup and training timing:
+
+- Persistent data root: `/workspace/nanochat-llava-data`
+- VQAv2 load/render time before training: `255.20s`
+- Split: `80,717` train records and `2,048` validation records
+- Real run output: `/workspace/nanochat-llava-data/checkpoints/vlm_latest_0de2303`
+- Final checkpoint: `model_001000.pt`
+- Total training time: `69.75m`
+
+Training summary:
+
+| metric | value |
+| --- | ---: |
+| final train loss, step 1000 | `0.475191` |
+| final raw loss, step 1000 | `0.519070` |
+| final tokens/sec | `4699.15` |
+| final BF16 MFU | `17.12%` |
+| best observed BF16 MFU | about `18%` |
+| peak memory | `71635.30MiB` |
+
+Validation loss:
+
+| step | val loss |
+| ---: | ---: |
+| 200 | `0.735346` |
+| 400 | `0.653892` |
+| 600 | `0.611143` |
+| 800 | `0.595511` |
+| 1000 | `0.586254` |
+
+The A100 result is below the Modal H100 `24-28%` MFU result above. That is
+expected for this run because it did not use the H100/FA3 path. The improved
+DataLoader path still matters on A100, but this hardware/software path topped
+out around `17-18%` MFU with inline SigLIP and no activation checkpointing.
+
+Step 2 versus step 1000 verifier scores, larger sample run:
+
+| benchmark | step 2 | step 1000 | delta | n |
+| --- | ---: | ---: | ---: | ---: |
+| MMStar | `0.3300` | `0.2800` | `-0.0500` | 200 |
+| ScienceQA | `0.4350` | `0.3050` | `-0.1300` | 200 |
+| ChartQA | `0.0550` | `0.1250` | `+0.0700` | 200 |
+| MMMU Accounting | `0.2333` | `0.2667` | `+0.0333` | 30 |
+| TextVQA | `0.0450` | `0.1400` | `+0.0950` | 200 |
+| Mean | `0.2197` | `0.2233` | `+0.0037` | - |
+
+JSON outputs:
+
+- Step 2:
+  `/workspace/nanochat-llava-data/checkpoints/vlm_latest_smoke_0de2303_eval_limit200.json`
+- Step 1000:
+  `/workspace/nanochat-llava-data/checkpoints/vlm_latest_0de2303_eval_limit200.json`
+
+Proper MMMU all-config run:
+
+- Configs: all 30 MMMU validation subjects, `30` examples each, `900` total
+- Step 2: `0.2489`, `224/900`
+- Step 1000: `0.2744`, `247/900`
+- Delta: `+0.0256`, `+23` correct
+- Step 2 JSON:
+  `/workspace/nanochat-llava-data/checkpoints/vlm_latest_smoke_0de2303_mmmu_all.json`
+- Step 1000 JSON:
+  `/workspace/nanochat-llava-data/checkpoints/vlm_latest_0de2303_mmmu_all.json`
+
+Largest MMMU gains were History `+0.300`, Art_Theory `+0.200`,
+Basic_Medical_Science `+0.200`, Finance `+0.167`, and
+Architecture_and_Engineering `+0.133`. Largest regressions were Agriculture
+`-0.167`, Marketing `-0.167`, Energy_and_Power `-0.133`, and
+Diagnostics_and_Laboratory_Medicine `-0.100`.
+
+Paired diagnostic, same records at step 2 and step 1000:
+
+| benchmark | n | step 2 | step 1000 | correct to wrong | wrong to correct | both wrong | both correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MMStar | 200 | `0.3300` | `0.2800` | 31 | 21 | 113 | 35 |
+| ScienceQA | 200 | `0.4350` | `0.3050` | 54 | 28 | 85 | 33 |
+| MMMU all | 900 | `0.2489` | `0.2744` | 96 | 119 | 557 | 128 |
+
+Paired diagnostic JSON:
+`/workspace/nanochat-llava-data/checkpoints/paired_compare_latest_step2_vs_1000.json`
+
+Interpretation:
+
+- Training clearly improved the held-out VQAv2 validation loss from `0.735346`
+  at step 200 to `0.586254` at step 1000.
+- The verifier benchmark movement is mixed. Step 1000 improved ChartQA,
+  TextVQA, and MMMU, but regressed MMStar and ScienceQA.
+- The MMStar and ScienceQA decreases are not only sample noise in this paired
+  run: MMStar had `31` correct-to-wrong flips versus `21` wrong-to-correct
+  flips, and ScienceQA had `54` correct-to-wrong flips versus `28`
+  wrong-to-correct flips.
+- The likely cause is task drift from VQAv2-only finetuning. Step 2 still has
+  more base SFT multiple-choice and science-prior behavior. After VQAv2
+  training, answers become more VQA-style and short/free-form, which helps
+  some visual QA cases but hurts option-letter stability and some science-prior
+  questions.
+- MMMU improves modestly overall when evaluated across all subjects, but most
+  examples are still hard failures: `557/900` are wrong at both step 2 and step
+  1000. This is expected because VQAv2 does not teach the domain-specific
+  diagram, table, formula, and professional-subject reasoning needed for MMMU.
+- MMMU verifier scores should be treated as rough diagnostics, not leaderboard
+  numbers. The current matcher can credit an initial option letter even when
+  the following generated text is semantically inconsistent, and can sometimes
+  credit answer text even when the emitted option letter is wrong.

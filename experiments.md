@@ -24,6 +24,59 @@ were intentionally removed to keep the implementation minimal.
 - Hugging Face cached dataset-server statistics for `HuggingFaceM4/FineVisionMax` report a partial 26,675-row stats sample with `texts` present on every row, mean `3.655` text entries per row, and `images` mean `0.714` images per row, median `1`, max `51`. Average item ratio in that stats sample is therefore image:text = `0.714:3.655`, about `1:5.12`.
 - Existing first-10k training-shape probe: `6,188` usable single-image rendered rows and `3,812` non-single-image/no-image rows, i.e. `61.88%` single-image renderable and `38.12%` other under that older probe. Source for cached stats: https://datasets-server.huggingface.co/statistics?dataset=HuggingFaceM4/FineVisionMax&config=default&split=train.
 
+## Batch and token budget target
+
+Reference VLM sample batch sizes:
+
+- nanoVLM-222M used global batch size `256` samples/update.
+- InternVL-Chat V1.2 SFT used global batch size `512` samples/update.
+- InternVL2/InternVL2.5 fine-tune scripts commonly use global batch size `128` samples/update.
+
+Current nanochat-llava H100 default shape:
+
+```text
+device_batch_size = 32
+num_gpus = 1
+max_seq_len = 512
+```
+
+Gradient accumulation to match a reference global sample batch:
+
+```text
+global_batch_samples = device_batch_size * num_gpus * grad_accum_steps
+grad_accum_steps = reference_global_batch_samples / (device_batch_size * num_gpus)
+```
+
+For nanoVLM-222M's global batch:
+
+```text
+grad_accum_steps = 256 / (32 * 1) = 8
+```
+
+Tokens per optimizer update with that setting:
+
+```text
+tokens_per_update = device_batch_size * max_seq_len * grad_accum_steps
+tokens_per_update = 32 * 512 * 8 = 131,072
+```
+
+Optimizer steps for about `1B` multimodal input tokens:
+
+```text
+num_iterations = 1,000,000,000 / 131,072 = 7,629.39
+```
+
+Use:
+
+```bash
+--grad-accum-steps 8 --num-iterations 7630
+```
+
+This matches nanoVLM-222M's reported global sample batch, not its approximate
+token batch. If matching nanoVLM-222M's approximate token batch instead, use
+`256 * 128 = 32,768` tokens/update, which maps to
+`32,768 / (32 * 512) = 2` grad accumulation steps on the current shape.
+
 ## Pitfalls to avoid
 
 - Do not re-add `vlm_precompute_siglip.py`, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, benchmark report generators, FP8 probes, profiling grids, or frozen-feature training shortcuts unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.

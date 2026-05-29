@@ -17,7 +17,7 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type
+from nanochat.common import COMPUTE_DTYPE, compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 
 # -----------------------------------------------------------------------------
@@ -173,17 +173,25 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(
+        self,
+        tokens,
+        num_samples=1,
+        max_tokens=None,
+        temperature=1.0,
+        top_k=None,
+        seed=42,
+        prefill_input_embeds=None,
+        prefill_value_token_ids=None,
+        prefill_length=None,
+    ):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # NOTE: setting the dtype here and in this way is an ugly hack.
-        # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
-        # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
-        # As a quick hack, we're making generate() function inherit and know about this repo-wise assumption.
-        # I think there has to be a bigger refactor to deal with device/dtype tracking across the codebase.
-        # In particular, the KVCache should allocate its tensors lazily
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        # Match the model's activation dtype when available. Test mocks do not
+        # expose embeddings, so keep the old device-based fallback for them.
+        embedding_weight = getattr(getattr(getattr(self.model, "transformer", None), "wte", None), "weight", None)
+        dtype = getattr(embedding_weight, "dtype", torch.bfloat16 if device.type == "cuda" else torch.float32)
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
@@ -196,22 +204,37 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # 1) Run a batch 1 prefill of the prompt tokens
+        # 1) Run a batch 1 prefill of the prompt tokens. Multimodal callers can
+        # provide prebuilt embeddings/value ids here; decode then stays token-only.
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        if prefill_input_embeds is not None:
+            assert prefill_value_token_ids is not None, "prefill_value_token_ids required with prefill_input_embeds"
+            assert prefill_input_embeds.size(0) == 1, "prefill batch must be 1"
+            assert prefill_value_token_ids.shape[:2] == prefill_input_embeds.shape[:2]
+            prompt_len = int(prefill_length) if prefill_length is not None else int(prefill_value_token_ids.size(1))
+            assert 0 < prompt_len <= prefill_value_token_ids.size(1)
+        else:
+            assert prefill_value_token_ids is None, "prefill_value_token_ids requires prefill_input_embeds"
+            prompt_len = len(tokens)
         kv_cache_prefill = KVCache(
             batch_size=1,
-            seq_len=len(tokens),
+            seq_len=prompt_len,
             device=device,
             dtype=dtype,
             **kv_model_kwargs,
         )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        if prefill_input_embeds is None:
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        else:
+            ids = prefill_value_token_ids[:, :prompt_len].to(device=device, dtype=torch.long)
+            input_embeds = prefill_input_embeds[:, :prompt_len].to(device=device)
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill, input_embeds=input_embeds)
+        logits = logits[:, prompt_len - 1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = (prompt_len + max_tokens) if max_tokens is not None else self.model.config.sequence_len
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,

@@ -157,9 +157,23 @@ class SigLIPPooledFeatureExtractor:
         return self.encode_pixel_values(self.preprocess(images))
 
 
+def count_text_image_markers(text: str) -> int:
+    return str(text).count(IMAGE_MARKER)
+
+
+def format_image_markers(image_count: int) -> str:
+    image_count = int(image_count)
+    if image_count <= 0:
+        return ""
+    if image_count == 1:
+        return IMAGE_MARKER
+    return "\n".join(f"Image {idx}: {IMAGE_MARKER}" for idx in range(1, image_count + 1))
+
+
 def encode_with_image_markers(tokenizer, text: str, image_token_id: int = IMAGE_TOKEN_ID) -> list[int]:
-    parts = text.split(IMAGE_MARKER)
+    text = str(text)
     ids: list[int] = []
+    parts = text.split(IMAGE_MARKER)
     for i, part in enumerate(parts):
         if part:
             ids.extend(tokenizer.encode(part))

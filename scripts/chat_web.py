@@ -46,16 +46,19 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
-from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine, sample_next_token
+from nanochat.common import COMPUTE_DTYPE, compute_init, autodetect_device_type
+from nanochat.checkpoint_manager import _patch_missing_config_keys, _patch_missing_keys, load_model
+from nanochat.engine import Engine
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.tokenizer import get_tokenizer
 from nanochat.vision import (
     IMAGE_MARKER,
     SIGLIP_MODEL_ID,
     SigLIPPooledFeatureExtractor,
+    VisionProjector,
     build_multimodal_batch,
     encode_with_image_markers,
-    load_vlm_checkpoint,
+    format_image_markers,
 )
 
 # Abuse prevention limits
@@ -68,7 +71,7 @@ MIN_TOP_K = 0 # 0 disables top-k filtering, using full vocabulary
 MAX_TOP_K = 200
 MIN_MAX_TOKENS = 1
 MAX_MAX_TOKENS = 4096
-MAX_IMAGES_PER_REQUEST = 4
+MAX_IMAGES_PER_REQUEST = 8
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 parser = argparse.ArgumentParser(description='NanoChat Web Server')
@@ -84,8 +87,11 @@ parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
 parser.add_argument('--vlm-checkpoint-dir', default=None, help='Optional VLM checkpoint directory; enables image chat')
 parser.add_argument('--vlm-checkpoint-step', type=int, default=None, help='VLM checkpoint step')
+parser.add_argument('--llm-checkpoint-dir', default=None, help='Optional language-model checkpoint directory to combine with a VLM projector')
+parser.add_argument('--llm-checkpoint-step', type=int, default=None, help='Language-model checkpoint step when --llm-checkpoint-dir is set')
 parser.add_argument('--siglip-model-id', default=SIGLIP_MODEL_ID, help='SigLIP model used by the VLM checkpoint')
 parser.add_argument('--siglip-cache-dir', default=None, help='Optional SigLIP cache directory')
+parser.add_argument('--eval-dtype', default='', choices=['', 'float32', 'float16', 'bfloat16'], help='Optional dtype for loading eval weights. Empty follows NANOCHAT_DTYPE/auto detection.')
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -98,6 +104,123 @@ logger = logging.getLogger(__name__)
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+
+DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def resolve_eval_dtype():
+    return DTYPE_MAP[args.eval_dtype] if args.eval_dtype else COMPUTE_DTYPE
+
+
+def cast_floating_tensors_in_place(state_dict, dtype):
+    for key, value in list(state_dict.items()):
+        if torch.is_tensor(value) and value.is_floating_point() and value.dtype != dtype:
+            state_dict[key] = value.to(dtype=dtype)
+    return state_dict
+
+
+def build_empty_gpt(model_config, device, dtype):
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device("meta"):
+            model = GPT(model_config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    model.to_empty(device=device)
+    head_dim = model_config.n_embd // model_config.n_head
+    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
+    return model
+
+
+def load_gpt_model_direct(checkpoint_dir, step, device, target_dtype):
+    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    model_state = torch.load(model_path, map_location="cpu", mmap=True)
+    model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
+
+    model_config_kwargs = dict(meta_data["model_config"])
+    _patch_missing_config_keys(model_config_kwargs)
+    model_config = GPTConfig(**model_config_kwargs)
+    _patch_missing_keys(model_state, model_config)
+    cast_floating_tensors_in_place(model_state, target_dtype)
+
+    print(f"Building GPT model directly from {checkpoint_dir}@{step} with dtype={target_dtype}", flush=True)
+    model = build_empty_gpt(model_config, device, target_dtype)
+    model.load_state_dict(model_state, strict=True)
+    del model_state
+
+    tokenizer = get_tokenizer()
+    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], (
+        f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size "
+        f"{model_config_kwargs['vocab_size']}"
+    )
+    return model, tokenizer, meta_data
+
+
+def load_vlm_model_direct(checkpoint_dir, step, device, llm_checkpoint_dir=None, llm_checkpoint_step=None):
+    """Load a VLM checkpoint without first materializing the base SFT model."""
+    target_dtype = resolve_eval_dtype()
+    if args.eval_dtype and target_dtype != COMPUTE_DTYPE:
+        print(
+            f"Warning: --eval-dtype={args.eval_dtype} only controls stored weights; "
+            f"activations still use NANOCHAT_DTYPE/auto={COMPUTE_DTYPE}.",
+            flush=True,
+        )
+
+    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    model_data = torch.load(model_path, map_location="cpu", mmap=True)
+    projector_state = model_data["projector"]
+    projector_config = model_data["projector_config"]
+
+    if llm_checkpoint_dir is None:
+        model_state = {k.removeprefix("_orig_mod."): v for k, v in model_data["model"].items()}
+        model_config_kwargs = dict(meta_data["model_config"])
+        _patch_missing_config_keys(model_config_kwargs)
+        model_config = GPTConfig(**model_config_kwargs)
+        _patch_missing_keys(model_state, model_config)
+        cast_floating_tensors_in_place(model_state, target_dtype)
+
+        print(f"Building VLM model directly from {checkpoint_dir}@{step} with dtype={target_dtype}", flush=True)
+        model = build_empty_gpt(model_config, device, target_dtype)
+        model.load_state_dict(model_state, strict=True)
+        del model_state
+
+        tokenizer = get_tokenizer()
+        assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], (
+            f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size "
+            f"{model_config_kwargs['vocab_size']}"
+        )
+    else:
+        assert llm_checkpoint_step is not None, "--llm-checkpoint-step is required with --llm-checkpoint-dir"
+        model, tokenizer, llm_meta = load_gpt_model_direct(llm_checkpoint_dir, llm_checkpoint_step, device, target_dtype)
+        meta_data = {
+            "vlm_projector_meta": meta_data,
+            "llm_meta": llm_meta,
+            "hybrid": True,
+        }
+
+    cast_floating_tensors_in_place(projector_state, target_dtype)
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(target_dtype)
+    try:
+        projector = VisionProjector(**projector_config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    projector.load_state_dict(projector_state, strict=True)
+    projector.to(device=device, dtype=target_dtype)
+    del projector_state, model_data
+    return model, tokenizer, projector, meta_data
 
 @dataclass
 class Worker:
@@ -130,6 +253,9 @@ class WorkerPool:
             assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
         if args.vlm_checkpoint_dir is not None:
             assert args.vlm_checkpoint_step is not None, "--vlm-checkpoint-step is required with --vlm-checkpoint-dir"
+        if args.llm_checkpoint_dir is not None:
+            assert args.vlm_checkpoint_dir is not None, "--llm-checkpoint-dir is only valid with --vlm-checkpoint-dir"
+            assert args.llm_checkpoint_step is not None, "--llm-checkpoint-step is required with --llm-checkpoint-dir"
 
         for gpu_id in range(self.num_gpus):
 
@@ -140,21 +266,30 @@ class WorkerPool:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
             projector = None
             extractor = None
             if args.vlm_checkpoint_dir is not None:
                 print(f"Loading VLM checkpoint on {device}: {args.vlm_checkpoint_dir}@{args.vlm_checkpoint_step}")
-                model_state, projector, _, _ = load_vlm_checkpoint(args.vlm_checkpoint_dir, args.vlm_checkpoint_step, device, load_optimizer=False)
-                model.load_state_dict(model_state, strict=True, assign=True)
+                if args.llm_checkpoint_dir is not None:
+                    print(f"Using language model from {args.llm_checkpoint_dir}@{args.llm_checkpoint_step}")
+                model, tokenizer, projector, _ = load_vlm_model_direct(
+                    args.vlm_checkpoint_dir,
+                    args.vlm_checkpoint_step,
+                    device,
+                    llm_checkpoint_dir=args.llm_checkpoint_dir,
+                    llm_checkpoint_step=args.llm_checkpoint_step,
+                )
                 projector.eval()
                 siglip_cache_dir = args.siglip_cache_dir or os.environ.get("NANOCHAT_SIGLIP_CACHE_DIR")
                 extractor = SigLIPPooledFeatureExtractor(
                     args.siglip_model_id,
                     device=device,
+                    dtype=resolve_eval_dtype() if device.type in {"cuda", "mps"} else None,
                     cache_dir=siglip_cache_dir,
                     verbose=gpu_id == 0,
                 )
+            else:
+                model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
             model.eval()
             engine = Engine(model, tokenizer)
             worker = Worker(
@@ -183,6 +318,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
     image: Optional[str] = None
+    images: Optional[List[str]] = None
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
@@ -205,7 +341,12 @@ def validate_chat_request(request: ChatRequest):
     total_length = 0
     image_count = 0
     for i, message in enumerate(request.messages):
-        if not message.content and not message.image:
+        message_images = []
+        if message.image:
+            message_images.append(message.image)
+        if message.images:
+            message_images.extend(message.images)
+        if not message.content and not message_images:
             raise HTTPException(status_code=400, detail=f"Message {i} has empty content")
 
         msg_length = len(message.content)
@@ -215,12 +356,13 @@ def validate_chat_request(request: ChatRequest):
                 detail=f"Message {i} is too long. Maximum {MAX_MESSAGE_LENGTH} characters allowed per message"
             )
         total_length += msg_length
-        if message.image:
+        if message_images:
             if message.role != "user":
-                raise HTTPException(status_code=400, detail=f"Message {i} has an image but is not a user message")
-            image_count += 1
-            if len(message.image) > MAX_IMAGE_BYTES * 2:
-                raise HTTPException(status_code=400, detail=f"Message {i} image is too large")
+                raise HTTPException(status_code=400, detail=f"Message {i} has images but is not a user message")
+            image_count += len(message_images)
+            for image_idx, image_data in enumerate(message_images):
+                if len(image_data) > MAX_IMAGE_BYTES * 2:
+                    raise HTTPException(status_code=400, detail=f"Message {i} image {image_idx} is too large")
 
     if total_length > MAX_TOTAL_CONVERSATION_LENGTH:
         raise HTTPException(
@@ -380,40 +522,44 @@ async def generate_vision_stream(
     max_new_tokens=None,
     top_k=None
 ) -> AsyncGenerator[str, None]:
-    """Simple no-KV-cache VLM streaming path."""
+    """Generate assistant response from a multimodal prompt with KV-cache decode."""
     temperature = temperature if temperature is not None else args.temperature
     max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
     top_k = top_k if top_k is not None else args.top_k
 
     assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
     bos = worker.tokenizer.get_bos_token_id()
-    rng = torch.Generator(device=worker.device)
-    rng.manual_seed(random.randint(0, 2**31 - 1))
 
     image_features = worker.extractor(images)
-    tokens = list(tokens)
+    row = list(tokens) + [tokens[-1]]
+    mask = [0] * len(row)
+    batch = build_multimodal_batch(
+        worker.model,
+        worker.projector,
+        [row],
+        image_features,
+        loss_mask_rows=[mask],
+        image_counts_per_row=[len(images)],
+        value_fallback_token_id=bos,
+    )
     accumulated_tokens = []
     last_clean_text = ""
 
-    for _ in range(max_new_tokens):
-        row = tokens + [tokens[-1]]
-        mask = [0] * len(row)
-        batch = build_multimodal_batch(
-            worker.model,
-            worker.projector,
-            [row],
-            image_features,
-            loss_mask_rows=[mask],
-            image_counts_per_row=[len(images)],
-            value_fallback_token_id=bos,
-        )
-        logits = worker.model(batch.value_token_ids, input_embeds=batch.input_embeds)
-        logits = logits[:, batch.lengths[0].item() - 1, :]
-        token = int(sample_next_token(logits, rng, temperature=temperature, top_k=top_k).item())
+    for token_column, token_masks in worker.engine.generate(
+        tokens,
+        num_samples=1,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        seed=random.randint(0, 2**31 - 1),
+        prefill_input_embeds=batch.input_embeds,
+        prefill_value_token_ids=batch.value_token_ids,
+        prefill_length=int(batch.lengths[0].item()),
+    ):
+        token = token_column[0]
         if token == assistant_end or token == bos:
             break
 
-        tokens.append(token)
         accumulated_tokens.append(token)
         current_text = worker.tokenizer.decode(accumulated_tokens)
         if not current_text.endswith('�'):
@@ -435,7 +581,8 @@ async def chat_completions(request: ChatRequest):
     # Log incoming conversation to console
     logger.info("="*20)
     for i, message in enumerate(request.messages):
-        image_suffix = " [image]" if message.image else ""
+        message_image_count = int(message.image is not None) + (len(message.images) if message.images else 0)
+        image_suffix = f" [{message_image_count} image{'s' if message_image_count != 1 else ''}]" if message_image_count else ""
         logger.info(f"[{message.role.upper()}]{image_suffix}: {message.content}")
     logger.info("-"*20)
 
@@ -456,13 +603,19 @@ async def chat_completions(request: ChatRequest):
         for message in request.messages:
             if message.role == "user":
                 conversation_tokens.append(user_start)
+                message_images = []
                 if message.image:
+                    message_images.append(message.image)
+                if message.images:
+                    message_images.extend(message.images)
+                if message_images:
                     if worker.projector is None or worker.extractor is None:
                         raise HTTPException(status_code=400, detail="Server was not started with --vlm-checkpoint-dir")
-                    images.append(decode_image_data(message.image))
+                    images.extend(decode_image_data(image_data) for image_data in message_images)
                     content = message.content.replace(IMAGE_MARKER, "").strip()
-                    content = content or "Describe the image."
-                    conversation_tokens.extend(encode_with_image_markers(worker.tokenizer, f"{IMAGE_MARKER}\n{content}"))
+                    content = content or ("Describe the images." if len(message_images) > 1 else "Describe the image.")
+                    image_markers = format_image_markers(len(message_images))
+                    conversation_tokens.extend(encode_with_image_markers(worker.tokenizer, f"{image_markers}\n{content}"))
                 else:
                     conversation_tokens.extend(worker.tokenizer.encode(message.content))
                 conversation_tokens.append(user_end)
@@ -544,4 +697,6 @@ if __name__ == "__main__":
     print(f"Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
     if args.vlm_checkpoint_dir is not None:
         print(f"VLM image chat: {args.vlm_checkpoint_dir}@{args.vlm_checkpoint_step}")
+        if args.llm_checkpoint_dir is not None:
+            print(f"Hybrid LLM checkpoint: {args.llm_checkpoint_dir}@{args.llm_checkpoint_step}")
     uvicorn.run(app, host=args.host, port=args.port)

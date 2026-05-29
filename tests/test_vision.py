@@ -17,8 +17,10 @@ from nanochat.vision import (
     VisionProjector,
     build_multimodal_batch,
     count_image_tokens,
+    count_text_image_markers,
     encode_with_image_markers,
     ensure_hf_nanochat_checkpoint,
+    format_image_markers,
     load_vlm_checkpoint,
     pool_siglip_features,
     render_caption_example,
@@ -148,6 +150,9 @@ def test_image_marker_encoding_and_rendering():
     tokenizer = TinyTokenizer()
     ids = encode_with_image_markers(tokenizer, f"look {IMAGE_MARKER} now")
     assert count_image_tokens(ids) == 1
+    assert count_text_image_markers("Image 1: <image>\nImage 2: <image>") == 2
+    assert format_image_markers(1) == IMAGE_MARKER
+    assert format_image_markers(2) == f"Image 1: {IMAGE_MARKER}\nImage 2: {IMAGE_MARKER}"
 
     caption_ids, caption_mask = render_caption_example(tokenizer, "a caption")
     assert count_image_tokens(caption_ids) == 1
@@ -436,6 +441,65 @@ def test_render_record_supports_text_only_and_multi_image():
     assert multi["image_count"] == 2
     assert image_values(multi["record"]) == ["a.jpg", "b.jpg"]
     assert count_image_tokens(multi["tokens"]) == 2
+    normalized = vlm_train._ensure_image_markers_in_conversation(
+        {
+            "images": ["a.jpg", "b.jpg"],
+            "messages": [{"role": "user", "content": "Compare them."}, {"role": "assistant", "content": "The second is brighter."}],
+        },
+        2,
+    )
+    assert normalized["messages"][0]["content"].startswith(f"Image 1: {IMAGE_MARKER}\nImage 2: {IMAGE_MARKER}\n")
+
+    explicit_per_turn = render_record(
+        {
+            "images": ["a.jpg", "b.jpg"],
+            "messages": [
+                {"role": "user", "content": "Image 1: <image>\nWhat is the first?"},
+                {"role": "assistant", "content": "A."},
+                {"role": "user", "content": "Image 2: <image>\nWhat is the second?"},
+                {"role": "assistant", "content": "B."},
+            ],
+        },
+        tokenizer,
+        max_seq_len=512,
+    )
+    assert explicit_per_turn is not None
+    assert explicit_per_turn["image_values"] == ["a.jpg", "b.jpg"]
+    assert count_image_tokens(explicit_per_turn["tokens"]) == 2
+    marker_positions = [i for i, tok in enumerate(explicit_per_turn["tokens"]) if tok == IMAGE_TOKEN_ID]
+    assert marker_positions[1] > marker_positions[0] + 10
+
+    implicit_per_turn = render_record(
+        {
+            "messages": [
+                {"role": "user", "content": "What is the first?", "image": "a.jpg"},
+                {"role": "assistant", "content": "A."},
+                {"role": "user", "content": "What is the second?", "images": ["b.jpg"]},
+                {"role": "assistant", "content": "B."},
+            ],
+        },
+        tokenizer,
+        max_seq_len=512,
+    )
+    assert implicit_per_turn is not None
+    assert implicit_per_turn["image_values"] == ["a.jpg", "b.jpg"]
+    assert count_image_tokens(implicit_per_turn["tokens"]) == 2
+    marker_positions = [i for i, tok in enumerate(implicit_per_turn["tokens"]) if tok == IMAGE_TOKEN_ID]
+    assert marker_positions[1] > marker_positions[0] + 10
+
+    implicit_text_pairs = render_record(
+        {
+            "texts": [
+                {"user": "What is the first?", "assistant": "A.", "image": "a.jpg"},
+                {"user": "What is the second?", "assistant": "B.", "images": ["b.jpg"]},
+            ],
+        },
+        tokenizer,
+        max_seq_len=512,
+    )
+    assert implicit_text_pairs is not None
+    assert implicit_text_pairs["image_values"] == ["a.jpg", "b.jpg"]
+    assert count_image_tokens(implicit_text_pairs["tokens"]) == 2
 
     mismatched = render_record(
         {

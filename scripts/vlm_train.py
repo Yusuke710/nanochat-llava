@@ -34,7 +34,9 @@ from nanochat.vision import (
     VisionProjector,
     build_multimodal_batch,
     count_image_tokens,
+    count_text_image_markers,
     ensure_hf_nanochat_checkpoint,
+    format_image_markers,
     load_vlm_checkpoint,
     render_vision_conversation,
     save_vlm_checkpoint,
@@ -52,18 +54,53 @@ DEFAULT_VAL_EXAMPLES = 2048
 PACK_CANDIDATE_MULTIPLIER = 24
 
 
-def _image_prefix(image_count):
-    return "\n".join([IMAGE_MARKER] * image_count)
+def _as_image_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item is not None]
+    return [value]
+
+
+def _image_values_from_mapping(mapping):
+    if not isinstance(mapping, dict):
+        return []
+    images = _as_image_list(mapping.get("images"))
+    if images:
+        return images
+    values = []
+    for key in IMAGE_KEYS:
+        values.extend(_as_image_list(mapping.get(key)))
+    return values
+
+
+def _turn_image_values(record):
+    values = []
+    for text in record.get("texts") or []:
+        values.extend(_image_values_from_mapping(text))
+    for msg in record.get("conversations") or record.get("messages") or []:
+        values.extend(_image_values_from_mapping(msg))
+    return values
+
+
+def _prepend_missing_image_markers(content, image_count):
+    if image_count > 0 and count_text_image_markers(content) == 0:
+        return f"{format_image_markers(image_count)}\n{content}"
+    return content
 
 
 def _ensure_image_markers_in_conversation(example, image_count):
     example = dict(example)
+    row_image_count = len(_image_values_from_mapping(example))
+    use_turn_images = row_image_count == 0
     conv = example.get("conversations") or example.get("messages")
     if conv is None and example.get("texts") is not None:
         conv = []
         for text in example["texts"]:
             user = text.get("user", "")
             assistant = text.get("assistant", "")
+            if use_turn_images:
+                user = _prepend_missing_image_markers(user, len(_image_values_from_mapping(text)))
             if user or assistant:
                 conv.extend([{"role": "user", "content": user}, {"role": "assistant", "content": assistant}])
         if conv:
@@ -72,7 +109,7 @@ def _ensure_image_markers_in_conversation(example, image_count):
         question = example.get("question", "Describe the image.")
         answer = example.get("answer", example.get("caption", ""))
         if image_count > 0:
-            question = f"{_image_prefix(image_count)}\n{question}"
+            question = f"{format_image_markers(image_count)}\n{question}"
         example["messages"] = [
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
@@ -82,11 +119,15 @@ def _ensure_image_markers_in_conversation(example, image_count):
     conv = [dict(msg) for msg in conv]
     key_role = "from" if "from" in conv[0] else "role"
     key_text = "value" if "value" in conv[0] else "content"
-    existing_markers = sum(str(msg.get(key_text, "")).count(IMAGE_MARKER) for msg in conv)
+    if use_turn_images:
+        for msg in conv:
+            if msg[key_role] in {"human", "user"}:
+                msg[key_text] = _prepend_missing_image_markers(msg.get(key_text, ""), len(_image_values_from_mapping(msg)))
+    existing_markers = sum(count_text_image_markers(msg.get(key_text, "")) for msg in conv)
     for msg in conv:
         if msg[key_role] in {"human", "user"}:
             if image_count > 0 and existing_markers == 0:
-                msg[key_text] = f"{_image_prefix(image_count)}\n{msg[key_text]}"
+                msg[key_text] = f"{format_image_markers(image_count)}\n{msg[key_text]}"
             break
     if "conversations" in example:
         example["conversations"] = conv
@@ -131,17 +172,8 @@ def load_local_records(path_arg):
 
 
 def image_values(record):
-    images = record.get("images")
-    if images is not None:
-        if isinstance(images, list):
-            return [image for image in images if image is not None]
-        return [images]
-    values = []
-    for key in IMAGE_KEYS:
-        value = record.get(key)
-        if value is not None:
-            values.append(value)
-    return values
+    values = _image_values_from_mapping(record)
+    return values if values else _turn_image_values(record)
 
 
 def get_zip_file(image_zip):

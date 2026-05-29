@@ -116,6 +116,24 @@ token batch. If matching nanoVLM-222M's approximate token batch instead, use
 `256 * 128 = 32,768` tokens/update, which maps to
 `32,768 / (32 * 512) = 2` grad accumulation steps on the current shape.
 
+Practical short-run anchor:
+
+- With the current single-GPU default shape and no gradient accumulation,
+  `device_batch_size=32`, `max_seq_len=512`, `grad_accum_steps=1`, each optimizer
+  step is roughly `32 * 512 = 16,384` expanded decoder input tokens. Therefore
+  `1,000` steps is about `16,384,000` tokens, i.e. about `16.4M` nominal packed
+  tokens. At the same shape, a `1B` token budget is about
+  `1,000,000,000 / 16,384 = 61,035` optimizer steps.
+- The 1,000-step VQAv2 and FineVisionMax probes are enough to inject visible
+  image conditioning into the LLM: validation loss moves, image/no-image or
+  aligned/shuffled controls separate, and simple qualitative prompts can ground
+  on easy images.
+- Treat `--num-iterations 1000` as a useful experiment-around-this-number point,
+  not a convergence target. It is a practical minimum for "did vision start to
+  attach?" checks before spending on longer runs. Sweeps around `500`, `1000`,
+  `2000`, and `4000` steps should compare held-out VLM loss, image ablations,
+  benchmark slices, and stored generations rather than aggregate score alone.
+
 ## Pitfalls to avoid
 
 - Do not re-add `vlm_precompute_siglip.py`, `/vol/features`, preflight scripts, resume/offset machinery, mem100 gates, benchmark report generators, FP8 probes, profiling grids, or frozen-feature training shortcuts unless there is a new explicit reason. They made the code harder to reason about before proving visual learning.
@@ -806,3 +824,110 @@ Interpretation:
   verifier result (`0.2158` versus `0.2233`). The more important signal is task
   reshuffling: broader FineVisionMax helped the science slice here, did not move
   MMMU Accounting, and reduced MMStar/ChartQA/TextVQA on this limited verifier.
+
+## Local WebUI qualitative check, 2026-05-29
+
+Checkpoint: `Yusuke710/nanochat-llava-finevisionmax-1gpu`, step `1000`,
+served locally on Apple MPS with `NANOCHAT_DTYPE=bfloat16` and a `96` token UI
+generation cap.
+
+Images:
+
+- `download (1).jpeg`: a hand holding a smartphone/camera in front of an
+  overpass and road at dusk. The phone screen also shows the road/bridge scene.
+- `download.jpeg`: a close-up strawberry on a light surface with a blurred green
+  background.
+
+Single-image behavior:
+
+| input | prompt | output | note |
+| --- | --- | --- | --- |
+| `download (1).jpeg` | `What is this` | `This is a photograph of a person holding a smartphone with a camera...` | Coarsely grounded on the phone/hand scene, but hallucinates details such as a handbag, cityscape, cars, pedestrians, and clothing. |
+| `download.jpeg` | `What is this` | `This is a picture of a strawberry.` | Correct simple object recognition. |
+
+Multi-turn and multi-image behavior:
+
+- Multi-turn image chat does not reliably bind the current answer to the current
+  image. In a two-turn reproduction, the first turn used `download (1).jpeg` and
+  the second turn used `download.jpeg`, both with `What is this`. The second
+  answer repeated the first phone/road scene instead of describing the
+  strawberry: `This is a photograph of a person holding a smartphone with a
+  camera...`.
+- Same-turn multi-image grounding is also unreliable. With both images attached
+  and the prompt `download(1).png download.png what are they`, a WebUI sample
+  produced: `The two figures are seated outdoors and are holding a smartphone,
+  suggesting they might be viewing a specific scene or event.` Local reruns were
+  unstable as well, including `click(x=0.62, y=0.51)` at low temperature and an
+  echo-like `download(1).png download (1)` at the default UI temperature.
+- Qualitative takeaway: the model can show coarse single-image grounding on easy
+  examples, but multi-turn image state and same-turn multi-image comparison are
+  not yet dependable. These should not be presented as working capabilities
+  without targeted training/eval coverage.
+
+FineVisionMax image-placement note:
+
+- FineVisionMax does contain multi-turn rows, but the common shape is repeated
+  QA pairs over the same image/document/diagram row. In a streamed 2k-row sample,
+  `1,229/2,000` rows had one image, `687/2,000` had no image, and only
+  `84/2,000` had multiple images. This is enough for simple single-image
+  grounding to emerge before arbitrary multi-image comparison is reliable.
+- A wider 10k-row streamed marker scan found `312/10,000` rows with literal
+  `<image>` markers, but all of those explicit-marker rows had exactly one
+  image. In that sample, multi-image rows had no literal markers, so they render
+  through the row-level all-images-first fallback. The local canonical renderer
+  now labels multi-image blocks as normal text:
+  `Image 1: <image>\nImage 2: <image>\nquestion 1\nanswer 1\nquestion 2\nanswer 2`.
+- In that sampled FineVisionMax slice, I did not find multi-image rows shaped as
+  separate per-turn image insertions:
+  `Image 1: <image>\nquestion 1\nanswer 1\nImage 2: <image>\nquestion 2\nanswer 2`.
+  That format should come from custom/mixed data if we want this behavior to
+  train directly.
+- The loader/rendering change needed for both cases is small and now lives in one
+  canonical formatter: single-image blocks render as `<image>`, while multi-image
+  blocks render as `Image 1: <image>`, `Image 2: <image>`, etc. The visual
+  placeholder remains plain `<image>`; `Image N:` is just ordinary text. Training
+  data normalization and the WebUI multimodal prompt path both use this style.
+  Explicit `<image>` markers in source data are still preserved wherever they
+  occur, and per-turn `image`/`images` fields insert markers into that user turn.
+- This matches the implementation pattern in nanoVLM and InternVL: the model
+  path replaces visual placeholder positions in the LLM input with projected
+  image embeddings, so the data renderer controls whether images appear at the
+  first turn or at later turns. nanoVLM replaces every `image_token_id` position
+  and explicitly supports arbitrary image-token placeholders per sample
+  (https://github.com/huggingface/nanoVLM/blob/main/models/vision_language_model.py);
+  InternVL expands each `<image>` into `<img><IMG_CONTEXT>*N</img>` and replaces
+  `<IMG_CONTEXT>` positions with ViT features
+  (https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py).
+- Related model prompt/rendering patterns:
+  - nanoVLM adds image-index text when multiple images are present:
+    `<image: 0>`, `<image: 1>`, then the visual placeholder tokens.
+    Source: https://github.com/huggingface/nanoVLM/blob/main/data/processors.py.
+  - InternVL supports both combined-image and separate-image modes. Its
+    separate-image example uses `Image-1: <image>\nImage-2: <image>\n...`.
+    Source: https://github.com/OpenGVLab/InternVL.
+  - Qwen2.5-VL / Qwen3-VL support both styles through template options. With
+    `add_vision_id=True`, images are rendered as `Picture 1:`, `Picture 2:`;
+    otherwise the template emits only vision placeholders.
+    Source: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/raw/main/tokenizer_config.json.
+  - MiniCPM-V 4.5 supports plain multi-image input, and also has a processor
+    `use_image_id` path that prepends tags like `<image_id>0</image_id>` before
+    an image placeholder.
+    Source: https://huggingface.co/openbmb/MiniCPM-V-4_5.
+  - DeepSeek-VL2's multi-image example is rendered with explicit labels such as
+    `This is image_1: <image>` and `This is image_2: <image>`.
+    Source: https://huggingface.co/deepseek-ai/deepseek-vl2.
+  - LLaVA-OneVision's HF chat template renders bare repeated `<image>` tokens
+    before text, with no automatic numbering.
+    Source: https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf/raw/main/chat_template.json.
+  - Idefics2 / SmolVLM templates render bare `<image>` markers in content order,
+    with no automatic numbering in the checked templates.
+    Source: https://huggingface.co/HuggingFaceM4/idefics2-8b-chatty/raw/main/processor_config.json.
+  - Pixtral interleaves image placeholders in content order; the Transformers
+    docs show text-image-text-image examples rather than automatic `Image 1:`
+    labels.
+    Source: https://huggingface.co/docs/transformers/model_doc/pixtral.
+- Multi-image FineVisionMax rows are often related document/page/diagram examples,
+  not random unrelated natural images that must be separately named or compared in
+  order. The phone plus strawberry WebUI test is therefore outside the strongest
+  part of the current data distribution and should get explicit training/eval
+  examples before being treated as a capability.

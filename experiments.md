@@ -24,6 +24,45 @@ were intentionally removed to keep the implementation minimal.
 - Hugging Face cached dataset-server statistics for `HuggingFaceM4/FineVisionMax` report a partial 26,675-row stats sample with `texts` present on every row, mean `3.655` text entries per row, and `images` mean `0.714` images per row, median `1`, max `51`. Average item ratio in that stats sample is therefore image:text = `0.714:3.655`, about `1:5.12`.
 - Existing first-10k training-shape probe: `6,188` usable single-image rendered rows and `3,812` non-single-image/no-image rows, i.e. `61.88%` single-image renderable and `38.12%` other under that older probe. Source for cached stats: https://datasets-server.huggingface.co/statistics?dataset=HuggingFaceM4/FineVisionMax&config=default&split=train.
 
+## Current CPU/GPU dataflow
+
+- CPU DataLoader side: stream/load records, normalize conversations, tokenize text, convert literal `<image>` to sentinel token id `-200`, build loss masks, decode images, run the SigLIP image processor, and pack fixed-shape rows.
+- CPU to GPU boundary: packed token/mask metadata and CPU `pixel_values` are handed to the training step; tensors used by the model are created on or moved to the GPU.
+- GPU vision side: frozen SigLIP consumes `pixel_values`, then the linear projector maps each image to 64 nanochat-width visual embeddings.
+- GPU multimodal side: `build_multimodal_batch` has CPU-side Python control flow, but the token-id tensors, token embedding lookup, visual embedding insertion, and final `input_embeds` live on GPU. SigLIP features do not bounce back to CPU.
+- GPU language side: nanochat GPT receives the constructed multimodal `input_embeds` plus targets and runs the normal forward/backward path.
+
+## Current VLM attention mental model
+
+- There are two different "image token" stages. In the vision encoder, image
+  patch tokens use bidirectional/full visual self-attention, so each exported
+  visual feature is already image-contextualized before it reaches nanochat.
+- After projection, the 64 visual features are inserted into the GPT input
+  stream as prefix embeddings. From that point on, nanochat uses the normal
+  causal decoder attention path. We do not build a modality-specific mask where
+  projected image tokens attend bidirectionally inside the LLM.
+- For a sequence like `IMG1 IMG2 IMG3 TXT1 TXT2 TXT3`, the LLM-side mask is
+  causal: `IMG1` sees only `IMG1`, `IMG2` sees `IMG1 IMG2`, `IMG3` sees
+  `IMG1 IMG2 IMG3`, and text tokens see all previous image/text tokens. The
+  practical effect is that bidirectional image understanding happens in SigLIP,
+  then causal decoder attention carries that visual context into text decoding.
+- The training loss mask is separate from the attention mask. Image positions
+  and prompt/user positions can be ignored as supervised targets while still
+  remaining visible as causal context for later tokens.
+- This matches the baseline pattern in nanoVLM and InternVL: nanoVLM replaces
+  image placeholder token embeddings and calls a causal language decoder after a
+  non-causal ViT image encoder
+  ([VLM forward](https://github.com/huggingface/nanoVLM/blob/main/models/vision_language_model.py#L62-L72),
+  [ViT non-causal attention](https://github.com/huggingface/nanoVLM/blob/main/models/vision_transformer.py#L81-L85),
+  [LM causal prefill](https://github.com/huggingface/nanoVLM/blob/main/models/language_model.py#L260-L278)).
+  InternVL similarly replaces `<IMG_CONTEXT>` embeddings, then calls a causal
+  LLM; its vision encoder uses `causal=False`, while InternLM2 FlashAttention
+  uses `causal=True` for multi-token prefill/training and only disables causal
+  masking for single-token KV-cache decode
+  ([InternVL embedding replacement](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L162-L203),
+  [InternViT causal=False](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_intern_vit.py#L239-L241),
+  [InternLM2 causal flag](https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internlm2/modeling_internlm2.py#L523-L573)).
+
 ## Batch and token budget target
 
 Reference VLM sample batch sizes:
@@ -670,3 +709,100 @@ Interpretation:
   numbers. The current matcher can credit an initial option letter even when
   the following generated text is semantically inconsistent, and can sometimes
   credit answer text even when the emitted option letter is wrong.
+
+## Vast.ai A100 80GB FineVisionMax stream run, 2026-05-27
+
+Repo state: `269e488374991d2d27f2dfc92619b8ea978dede6`, run on a single
+A100-SXM4-80GB Vast.ai box. The repo again reported `has_fa3_varlen=False`, so
+training used the SDPA varlen fallback. Setup used the default
+`HuggingFaceM4/FineVisionMax` stream, not a local JSON/VQAv2 conversion.
+Focused verification passed with
+`uv run python -m pytest tests/test_vision.py tests/test_vlm_smoke.py -q`:
+`27 passed`.
+
+Smoke and upload:
+
+- Smoke checkpoint: `/workspace/nanochat-llava-data/checkpoints/vlm_smoke`
+- Smoke eval JSON: `/workspace/nanochat-llava-data/checkpoints/vlm_smoke_eval.json`
+- Smoke eval: `mmstar=1.0000`, `n=1`
+- Final checkpoint: `/workspace/nanochat-llava-data/checkpoints/vlm/model_001000.pt`
+- Metadata: `/workspace/nanochat-llava-data/checkpoints/vlm/meta_001000.json`
+- Hugging Face upload:
+  `Yusuke710/nanochat-llava-finevisionmax-1gpu`
+
+Training summary:
+
+| metric | value |
+| --- | ---: |
+| final train loss, step 1000 | `1.298515` |
+| final raw loss, step 1000 | `1.319070` |
+| final tokens/sec | `4688.74` |
+| final BF16 MFU | `17.54%` |
+| warm tokens/sec range | about `4.7k-5.9k` |
+| warm BF16 MFU range | about `17-22%` |
+| peak memory | `75646.67MiB` |
+| total training time | `57.99m` |
+
+Validation loss:
+
+| step | val loss |
+| ---: | ---: |
+| 200 | `1.409743` |
+| 400 | `1.346387` |
+| 600 | `1.311720` |
+| 800 | `1.291577` |
+| 1000 | `1.281523` |
+
+The FineVisionMax validation loss scale is not comparable to the earlier
+VQAv2-only run because the held-out stream is mixed text-only, single-image,
+and multi-image data with different target distributions. Throughput is
+comparable to the previous A100 run, while peak memory rose from
+`71635.30MiB` to `75646.67MiB`, consistent with the mixed-modality packing and
+higher image cap.
+
+Step 1000 verifier scores, matching the prior `limit=200` suite:
+
+| benchmark | VQAv2 step 1000 | FineVisionMax step 1000 | delta | n |
+| --- | ---: | ---: | ---: | ---: |
+| MMStar | `0.2800` | `0.1750` | `-0.1050` | 200 |
+| ScienceQA | `0.3050` | `0.4421` | `+0.1371` | 95 |
+| ChartQA | `0.1250` | `0.0750` | `-0.0500` | 200 |
+| MMMU Accounting | `0.2667` | `0.2667` | `+0.0000` | 30 |
+| TextVQA | `0.1400` | `0.1200` | `-0.0200` | 200 |
+| Mean | `0.2233` | `0.2158` | `-0.0076` | - |
+
+JSON output:
+`/workspace/nanochat-llava-data/checkpoints/vlm_finevisionmax_1gpu_eval_limit200.json`
+
+ScienceQA caveat: this run scanned 200 records but evaluated only 95 image
+records because 105 records raised `KeyError: 'no PIL image field found'`.
+Treat the ScienceQA delta as directional, not a paired comparison with the
+older `n=200` row.
+
+Sample generations:
+
+- `mmstar`: predicted `D` for the suitcase/object-relationship example; answer
+  was `A`. It did get the guitar-theme and trees examples correct.
+- `scienceqa`: predicted `B`, `C`, and `B` correctly for the first three
+  printed image examples, then missed the New Zealand falcon feet question.
+- `chartqa`: still weak on chart grounding, e.g. predicted `red` where the
+  answer was `Blue`, and `2013` where the answer was `2018`.
+- `mmmu`: Accounting remained essentially unchanged from the VQAv2 run:
+  `0.2667`, `8/30`.
+- `textvqa`: produced more OCR-shaped strings than the early runs, but the
+  printed samples were still wrong: `DROPPAGE` for `copenhagen`, `Sulfury` for
+  `ale`, and `Mason's` for `bowmore`.
+
+Interpretation:
+
+- Switching from VQAv2-only to FineVisionMax removed the clear VQAv2-specialized
+  gains on ChartQA/TextVQA seen in the previous run and further hurt MMStar on
+  this sample.
+- ScienceQA improved on the evaluated image subset, which is consistent with
+  FineVisionMax being broader and less pure-VQA-style than the earlier data.
+  Because the evaluated ScienceQA subset changed to 95 usable image rows, this
+  needs a paired diagnostic before treating it as a real regression fix.
+- The aggregate mean is effectively flat versus the previous VQAv2 step-1000
+  verifier result (`0.2158` versus `0.2233`). The more important signal is task
+  reshuffling: broader FineVisionMax helped the science slice here, did not move
+  MMMU Accounting, and reduced MMStar/ChartQA/TextVQA on this limited verifier.

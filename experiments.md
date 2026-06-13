@@ -864,6 +864,31 @@ Multi-turn and multi-image behavior:
   not yet dependable. These should not be presented as working capabilities
   without targeted training/eval coverage.
 
+Image-ID rerun and final renderer policy:
+
+- Tested global image IDs across the full request, where a two-turn request with
+  one image per turn rendered the first user image as `Image 1: <image>` and the
+  second user image as `Image 2: <image>`.
+- Reproduced the old multi-turn failure with `download (1).jpeg` first and
+  `download.jpeg` second. The second turn still repeated the phone/sky scene
+  instead of describing the strawberry, even when the second prompt explicitly
+  asked `What is Image 2?`.
+- Reproduced same-turn two-image prompts. The new labels avoided the previous
+  degenerate `click(...)` / filename-echo outputs, but the model still collapsed
+  both images toward the phone scene or described the strawberry as another
+  smartphone/person image.
+- Single-image strawberry remained correct: `This is a picture of a strawberry.`
+- Decision after the cache/transcript review: use labels consistently when the
+  loader inserts image markers, but never retroactively rewrite earlier turns.
+  A one-image turn renders as `Image 1: <image>` from the start. A later
+  one-image turn also renders as `Image 1: <image>` within that turn, because the
+  stable cacheable unit is the user turn/block, not a global conversation rewrite.
+- Interpretation: image labels are the right renderer shape if we want the model
+  to learn one prompt grammar. This checkpoint has not learned reliable image-ID
+  binding yet because it was not trained with this rewrite. The next quality move
+  is targeted training/eval data rendered with the same labeled grammar, not
+  further prompt plumbing.
+
 FineVisionMax image-placement note:
 
 - FineVisionMax does contain multi-turn rows, but the common shape is repeated
@@ -883,12 +908,12 @@ FineVisionMax image-placement note:
   That format should come from custom/mixed data if we want this behavior to
   train directly.
 - The loader/rendering change needed for both cases is small and now lives in one
-  canonical formatter: single-image blocks render as `<image>`, while multi-image
-  blocks render as `Image 1: <image>`, `Image 2: <image>`, etc. The visual
-  placeholder remains plain `<image>`; `Image N:` is just ordinary text. Training
-  data normalization and the WebUI multimodal prompt path both use this style.
-  Explicit `<image>` markers in source data are still preserved wherever they
-  occur, and per-turn `image`/`images` fields insert markers into that user turn.
+  canonical formatter: every inserted image block renders as `Image 1: <image>`,
+  `Image 2: <image>`, etc. The visual placeholder remains plain `<image>`;
+  `Image N:` is just ordinary text. Training data normalization and the WebUI
+  multimodal prompt path both use this style. Explicit `<image>` markers in
+  source data are still preserved wherever they occur, so already-authored data
+  is not rewritten.
 - This matches the implementation pattern in nanoVLM and InternVL: the model
   path replaces visual placeholder positions in the LLM input with projected
   image embeddings, so the data renderer controls whether images appear at the
@@ -899,6 +924,10 @@ FineVisionMax image-placement note:
   `<IMG_CONTEXT>` positions with ViT features
   (https://github.com/OpenGVLab/InternVL/blob/main/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py).
 - Related model prompt/rendering patterns:
+  - InternVL 2.5 is the clearest training-time precedent. Its technical report
+    says single-image datasets use visual tokens enclosed by `<img>` and `</img>`
+    with no extra auxiliary tags, while multi-image datasets identify each image
+    with auxiliary tags like `Image-1`.
   - nanoVLM adds image-index text when multiple images are present:
     `<image: 0>`, `<image: 1>`, then the visual placeholder tokens.
     Source: https://github.com/huggingface/nanoVLM/blob/main/data/processors.py.
@@ -907,14 +936,19 @@ FineVisionMax image-placement note:
     Source: https://github.com/OpenGVLab/InternVL.
   - Qwen2.5-VL / Qwen3-VL support both styles through template options. With
     `add_vision_id=True`, images are rendered as `Picture 1:`, `Picture 2:`;
-    otherwise the template emits only vision placeholders.
+    otherwise the template emits only vision placeholders. The public fine-tune
+    processor path checked here calls `apply_chat_template(...)` without forcing
+    `add_vision_id`, so labels are a supported renderer option rather than clear
+    evidence that all Qwen training data is labeled.
     Source: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/raw/main/tokenizer_config.json.
   - MiniCPM-V 4.5 supports plain multi-image input, and also has a processor
     `use_image_id` path that prepends tags like `<image_id>0</image_id>` before
     an image placeholder.
     Source: https://huggingface.co/openbmb/MiniCPM-V-4_5.
   - DeepSeek-VL2's multi-image example is rendered with explicit labels such as
-    `This is image_1: <image>` and `This is image_2: <image>`.
+    `This is image_1: <image>` and `This is image_2: <image>`. Its processor
+    consumes `<image>` tokens from the prompt text rather than adding those
+    labels automatically, so labels must come from the data/prompt.
     Source: https://huggingface.co/deepseek-ai/deepseek-vl2.
   - LLaVA-OneVision's HF chat template renders bare repeated `<image>` tokens
     before text, with no automatic numbering.
@@ -926,6 +960,13 @@ FineVisionMax image-placement note:
     docs show text-image-text-image examples rather than automatic `Image 1:`
     labels.
     Source: https://huggingface.co/docs/transformers/model_doc/pixtral.
+- Local policy and justification: rewrite unlabeled image examples consistently
+  to `Image N: <image>` in the loader and inference renderer, including
+  single-image examples. This intentionally changes the serialized prompt format
+  from many source datasets, but the dataset content is unchanged and the benefit
+  is one grammar for the model to learn. The rule is cache-stable because labels
+  are present when each turn/block is first rendered; no earlier turn is
+  rewritten when a later image appears.
 - Multi-image FineVisionMax rows are often related document/page/diagram examples,
   not random unrelated natural images that must be separately named or compared in
   order. The phone plus strawberry WebUI test is therefore outside the strongest

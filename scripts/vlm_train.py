@@ -100,7 +100,8 @@ def _ensure_image_markers_in_conversation(example, image_count):
             user = text.get("user", "")
             assistant = text.get("assistant", "")
             if use_turn_images:
-                user = _prepend_missing_image_markers(user, len(_image_values_from_mapping(text)))
+                turn_image_count = len(_image_values_from_mapping(text))
+                user = _prepend_missing_image_markers(user, turn_image_count)
             if user or assistant:
                 conv.extend([{"role": "user", "content": user}, {"role": "assistant", "content": assistant}])
         if conv:
@@ -122,7 +123,8 @@ def _ensure_image_markers_in_conversation(example, image_count):
     if use_turn_images:
         for msg in conv:
             if msg[key_role] in {"human", "user"}:
-                msg[key_text] = _prepend_missing_image_markers(msg.get(key_text, ""), len(_image_values_from_mapping(msg)))
+                turn_image_count = len(_image_values_from_mapping(msg))
+                msg[key_text] = _prepend_missing_image_markers(msg.get(key_text, ""), turn_image_count)
     existing_markers = sum(count_text_image_markers(msg.get(key_text, "")) for msg in conv)
     for msg in conv:
         if msg[key_role] in {"human", "user"}:

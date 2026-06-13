@@ -151,7 +151,7 @@ def test_image_marker_encoding_and_rendering():
     ids = encode_with_image_markers(tokenizer, f"look {IMAGE_MARKER} now")
     assert count_image_tokens(ids) == 1
     assert count_text_image_markers("Image 1: <image>\nImage 2: <image>") == 2
-    assert format_image_markers(1) == IMAGE_MARKER
+    assert format_image_markers(1) == f"Image 1: {IMAGE_MARKER}"
     assert format_image_markers(2) == f"Image 1: {IMAGE_MARKER}\nImage 2: {IMAGE_MARKER}"
 
     caption_ids, caption_mask = render_caption_example(tokenizer, "a caption")
@@ -486,6 +486,19 @@ def test_render_record_supports_text_only_and_multi_image():
     assert count_image_tokens(implicit_per_turn["tokens"]) == 2
     marker_positions = [i for i, tok in enumerate(implicit_per_turn["tokens"]) if tok == IMAGE_TOKEN_ID]
     assert marker_positions[1] > marker_positions[0] + 10
+    normalized = vlm_train._ensure_image_markers_in_conversation(
+        {
+            "messages": [
+                {"role": "user", "content": "What is the first?", "image": "a.jpg"},
+                {"role": "assistant", "content": "A."},
+                {"role": "user", "content": "What is the second?", "images": ["b.jpg"]},
+                {"role": "assistant", "content": "B."},
+            ],
+        },
+        2,
+    )
+    assert normalized["messages"][0]["content"].startswith(f"Image 1: {IMAGE_MARKER}\n")
+    assert normalized["messages"][2]["content"].startswith(f"Image 1: {IMAGE_MARKER}\n")
 
     implicit_text_pairs = render_record(
         {

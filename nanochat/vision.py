@@ -165,8 +165,6 @@ def format_image_markers(image_count: int) -> str:
     image_count = int(image_count)
     if image_count <= 0:
         return ""
-    if image_count == 1:
-        return IMAGE_MARKER
     return "\n".join(f"Image {idx}: {IMAGE_MARKER}" for idx in range(1, image_count + 1))
 
 
